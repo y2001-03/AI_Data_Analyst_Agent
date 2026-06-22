@@ -1,0 +1,14 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+sqlalchemy==2.0.41
+psycopg[binary]==3.2.9
+pydantic-settings==2.10.1
+pandas==2.3.1
+numpy==2.3.1
+matplotlib==3.10.3
+openpyxl==3.1.5
+python-multipart==0.0.20
+langchain==0.3.26
+langgraph==0.6.0
+pgvector==0.4.1
+duckdb==1.1.3
