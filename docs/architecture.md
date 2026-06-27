@@ -14,10 +14,10 @@ flowchart TD
     api --> upload[Upload API Entry]
     api --> chat[Chat API Entry]
 
-    upload --> graph[LangGraph Workflow]
-    chat --> graph
+    upload --> workflow[LangGraph Workflow]
+    chat --> workflow
 
-    graph --> understand[Understand Node]
+    workflow --> understand[Understand Node]
     understand --> dataset_ctx[Dataset Context Service]
     understand --> memory[Memory Service]
 
@@ -38,8 +38,8 @@ flowchart TD
     results --> report[Report]
     results --> debug[Debug]
 
-    memory -.context.-> graph
-    dataset_ctx -.dataset metadata.-> graph
+    memory -.context.-> workflow
+    dataset_ctx -.dataset metadata.-> workflow
 
     plan -.fallback route.-> execute
     execute -.skip on tool failure.-> debug
@@ -51,7 +51,7 @@ flowchart TD
 
 ## 对话流程
 
-对话流程复用与上传流程一致的工作流模型，但入口从文件上传接口切换为对话接口。用户问题会与当前激活的数据集上下文以及可选的记忆上下文一起传入图工作流。图工作流负责判断问题意图、规划分析任务，并选择对应工具生成结果。这种设计保证了上传分析和后续追问共享同一套编排模型，便于保持上下文一致性。
+对话流程复用与上传流程一致的工作流模型，但入口从文件上传接口切换为对话接口。用户问题会与当前激活的数据集上下文以及可选的记忆上下文一起传入工作流。工作流负责判断问题意图、规划分析任务，并选择对应工具生成结果。这种设计保证了上传分析和后续追问共享同一套编排模型，便于保持上下文一致性。
 
 ## 规划流程
 
@@ -63,8 +63,8 @@ flowchart TD
 
 ## 记忆流程
 
-Memory Service 作为图工作流的旁路支撑服务存在，它提供上下文信息，而不是直接控制执行逻辑。它可以存储最近的用户意图、分析偏好、历史结果以及会话级提示。在后续请求中，图工作流可以读取这些上下文，以提升规划质量并支持跨轮连续分析。在当前架构中，记忆层被设计为支持长期分析对话的辅助服务。
+Memory Service 作为工作流的旁路支撑服务存在，它提供上下文信息，而不是直接控制执行逻辑。它可以存储最近的用户意图、分析偏好、历史结果以及会话级提示。在后续请求中，工作流可以读取这些上下文，以提升规划质量并支持跨轮连续分析。在当前架构中，记忆层被设计为支持长期分析对话的辅助服务。
 
 ## 调试流程
 
-调试流程主要用于系统可观测性和面试展示。LangGraph 工作流在执行过程中，会将每个节点的执行路径、节点状态以及追踪日志写入图状态中。对于 fallback 分支和 skipped 步骤，系统也会显式记录，使前端 Debug Panel 可以高亮展示这些情况。这让开发者和面试官能够清楚看到系统尝试了什么、在哪一步发生了降级，以及最终结果是如何生成的。
+调试流程主要用于系统可观测性和演示展示。LangGraph 工作流在执行过程中，会将每个节点的执行路径、节点状态以及追踪日志写入工作流状态中。对于 fallback 分支和 skipped 步骤，系统也会显式记录，使前端 Debug Panel 可以高亮展示这些情况。这让开发者和演示者能够清楚看到系统尝试了什么、在哪一步发生了降级，以及最终结果是如何生成的。
