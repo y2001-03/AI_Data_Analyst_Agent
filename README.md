@@ -43,10 +43,10 @@ flowchart TD
     api --> upload[Upload API Entry]
     api --> chat[Chat API Entry]
 
-    upload --> graph[LangGraph Workflow]
-    chat --> graph
+    upload --> workflow[LangGraph Workflow]
+    chat --> workflow
 
-    graph --> understand[Understand Node]
+    workflow --> understand[Understand Node]
     understand --> dataset_ctx[Dataset Context Service]
     understand --> memory[Memory Service]
 
@@ -67,8 +67,8 @@ flowchart TD
     results --> report[Report]
     results --> debug[Debug]
 
-    memory -.context.-> graph
-    dataset_ctx -.dataset metadata.-> graph
+    memory -.context.-> workflow
+    dataset_ctx -.dataset metadata.-> workflow
 
     plan -.fallback route.-> execute
     execute -.skip on tool failure.-> debug
