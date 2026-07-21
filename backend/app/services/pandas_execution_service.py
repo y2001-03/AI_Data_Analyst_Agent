@@ -29,6 +29,8 @@ class PandasExecutionService:
     def __init__(self, registry: ToolRegistry | None = None) -> None:
         self.registry = registry or ToolRegistry.with_default_tools()
         self.task_type_tools = {
+            "data_cleaning_plan": "data_cleaning_tool",
+            "data_cleaning_execute": "data_cleaning_tool",
             "data_quality_analysis": "data_quality_tool",
             "sql": "sql_tool",
             "trend": "trend_tool",
@@ -36,6 +38,24 @@ class PandasExecutionService:
             "stats": "stats_tool",
         }
         self.task_tool_mappings = (
+            TaskToolMapping(
+                tool_name="data_cleaning_tool",
+                keywords=(
+                    "data cleaning",
+                    "cleaning plan",
+                    "clean data",
+                    "fill missing",
+                    "drop duplicate",
+                    "trim string",
+                    "convert dtype",
+                    "数据清洗",
+                    "清洗方案",
+                    "填充缺失",
+                    "删除重复",
+                    "清理空格",
+                    "类型转换",
+                ),
+            ),
             TaskToolMapping(
                 tool_name="data_quality_tool",
                 keywords=(
@@ -92,7 +112,10 @@ class PandasExecutionService:
     ) -> ExecutionResponse:
         """Execute a list of tasks against a dataframe."""
         context = self._build_context(dataframe)
-        results = [self._execute_task(dataframe.copy(), task, context) for task in tasks]
+        results = [
+            self._execute_task(dataframe.copy(deep=True), task, context)
+            for task in tasks
+        ]
         return ExecutionResponse(execution_results=results)
 
     def _execute_task(
@@ -120,16 +143,15 @@ class PandasExecutionService:
 
     def _build_context(self, dataframe: pd.DataFrame) -> DatasetContext:
         """Infer reusable dataframe metadata."""
-        typed = dataframe.copy()
         datetime_columns: list[str] = []
-        for column in typed.columns:
-            if pd.api.types.is_datetime64_any_dtype(typed[column]):
+        for column in dataframe.columns:
+            series = dataframe[column]
+            if pd.api.types.is_datetime64_any_dtype(series):
                 datetime_columns.append(column)
                 continue
-            if self._looks_like_datetime_column(typed[column]):
-                typed[column] = pd.to_datetime(typed[column], errors="coerce")
-                if typed[column].notna().any():
-                    dataframe[column] = typed[column]
+            if self._looks_like_datetime_column(series):
+                inferred_datetime = pd.to_datetime(series, errors="coerce")
+                if inferred_datetime.notna().any():
                     datetime_columns.append(column)
         numeric_columns = dataframe.select_dtypes(include=["number"]).columns.tolist()
         categorical_columns = [

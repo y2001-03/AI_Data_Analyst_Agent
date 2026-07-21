@@ -107,6 +107,13 @@ class AnalysisPlannerService:
             "counts, quality issues, and a generic heuristic quality score; choose it when users ask to check data "
             "quality, whether data has problems, missing values, duplicate data, poor-quality fields, or to inspect "
             "the data before analysis. "
+            "data_cleaning_plan proposes explainable actions without changing data; choose it when users ask how "
+            "the data should be cleaned or explicitly request a cleaning plan. "
+            "data_cleaning_execute applies only explicitly requested actions to a dataframe copy; choose it only "
+            "when the user uses a clear action verb such as remove, fill, trim, convert, apply, or execute. "
+            "For data_cleaning_execute, params.actions must list explicit actions using action_type, optional column, "
+            "and parameters. Supported action_type values are drop_duplicates, fill_missing, drop_missing_rows, "
+            "trim_strings, and convert_dtype. Never turn a question about missing or duplicate data into execution. "
             "stats summarizes numeric distributions or ranks records. "
             "groupby compares metrics across categorical segments. "
             "trend analyzes time/date based changes. "
@@ -192,6 +199,13 @@ class AnalysisPlannerService:
                 "Structured data quality report with missing values, duplicate rows, uniqueness, "
                 "constant columns, possible ID columns, IQR outlier counts, issues, and quality score."
             )
+        if task_type == "data_cleaning_plan":
+            return "Explainable cleaning plan with affected-row estimates, risk levels, and no data changes."
+        if task_type == "data_cleaning_execute":
+            return (
+                "Cleaning execution summary with per-action status, audit log, and JSON-safe preview; "
+                "the original dataset remains unchanged."
+            )
         if task_type == "chart":
             return f"Visualization output using {columns_text}."
         return f"Summary statistics using {columns_text}."
@@ -209,6 +223,17 @@ class AnalysisPlannerService:
         primary_column = file_info.columns[0].name if file_info.columns else "primary field"
         lowered_question = (question or "").lower()
         if question:
+            cleaning_plan_tokens = (
+                "cleaning plan", "cleaning advice", "how to clean", "should clean", "should i",
+                "what should", "can i",
+                "清洗方案", "清洗建议", "怎么清洗", "如何清洗", "应该怎么清洗", "先给我方案",
+                "如何处理", "怎么处理", "应该如何处理", "要不要", "是否应该", "该不该", "建议",
+            )
+            cleaning_execute_tokens = (
+                "remove ", "delete ", "drop ", "fill ", "trim ", "convert ", "execute ", "apply ",
+                "clean the data", "clean this data",
+                "删除", "填充", "清理", "转换", "执行", "应用", "去重",
+            )
             quality_tokens = (
                 "data quality", "quality", "missing", "duplicate", "duplicates",
                 "reliable", "reliability", "outlier", "constant column", "id column",
@@ -222,6 +247,34 @@ class AnalysisPlannerService:
                 "by", "segment", "category", "product", "region", "group",
                 "分组", "按", "产品", "类别", "地区", "对比", "统计",
             )
+            if any(token in lowered_question for token in cleaning_plan_tokens):
+                return [
+                    AnalysisTask(
+                        task_name="Question-Focused Data Cleaning Plan",
+                        reasoning=f"Propose safe cleaning actions for the user's request: {question}",
+                        expected_output=(
+                            "Explainable cleaning plan with affected-row estimates and risk levels; "
+                            "no changes to the original dataset."
+                        ),
+                        type="data_cleaning_plan",
+                        params={"mode": "plan"},
+                    ),
+                ]
+            if any(token in lowered_question for token in cleaning_execute_tokens):
+                return [
+                    AnalysisTask(
+                        task_name="Question-Focused Data Cleaning Execution",
+                        reasoning=f"Execute only the cleaning actions explicitly requested: {question}",
+                        expected_output=(
+                            "Cleaning execution summary with action status, audit log, and preview."
+                        ),
+                        type="data_cleaning_execute",
+                        params={
+                            "mode": "execute",
+                            "actions": self._fallback_cleaning_actions(file_info, lowered_question),
+                        },
+                    ),
+                ]
             if any(token in lowered_question for token in quality_tokens):
                 return [
                     AnalysisTask(
@@ -308,3 +361,68 @@ class AnalysisPlannerService:
                 params={},
             ),
         ]
+
+    def _fallback_cleaning_actions(
+        self,
+        file_info: DatasetUploadResponse,
+        question: str,
+    ) -> list[dict[str, object]]:
+        """Extract only unambiguous cleaning actions for deterministic fallback."""
+        actions: list[dict[str, object]] = []
+        column = next(
+            (profile.name for profile in file_info.columns if profile.name.lower() in question),
+            None,
+        )
+        if any(token in question for token in ("duplicate", "duplicates", "重复", "去重")) and any(
+            token in question for token in ("remove", "delete", "drop", "删除", "去重")
+        ):
+            actions.append(
+                {
+                    "action_type": "drop_duplicates",
+                    "parameters": {"keep": "first"},
+                }
+            )
+
+        fill_strategy = None
+        if any(token in question for token in ("median", "中位数")):
+            fill_strategy = "median"
+        elif any(token in question for token in ("mean", "average", "均值", "平均值")):
+            fill_strategy = "mean"
+        elif any(token in question for token in ("mode", "众数")):
+            fill_strategy = "mode"
+        if column and fill_strategy and any(token in question for token in ("fill", "填充")):
+            actions.append(
+                {
+                    "action_type": "fill_missing",
+                    "column": column,
+                    "parameters": {"strategy": fill_strategy},
+                }
+            )
+
+        if any(token in question for token in ("trim", "whitespace", "空格")) and any(
+            token in question for token in ("trim", "remove", "clean", "清理", "删除")
+        ):
+            action: dict[str, object] = {
+                "action_type": "trim_strings",
+                "parameters": {"convert_blank_to_null": True},
+            }
+            if column:
+                action["column"] = column
+            actions.append(action)
+
+        target_type = None
+        if any(token in question for token in ("datetime", "date", "日期", "时间")):
+            target_type = "datetime"
+        elif any(token in question for token in ("numeric", "number", "数值", "数字")):
+            target_type = "numeric"
+        elif any(token in question for token in ("boolean", "bool", "布尔")):
+            target_type = "boolean"
+        if column and target_type and any(token in question for token in ("convert", "转换")):
+            actions.append(
+                {
+                    "action_type": "convert_dtype",
+                    "column": column,
+                    "parameters": {"target_type": target_type},
+                }
+            )
+        return actions
