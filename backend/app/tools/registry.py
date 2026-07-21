@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.tools.data_quality_tool import DataQualityTool
 from app.tools.dataframe_tools import DataframeTool, GroupByTool, StatsTool, TrendTool
 from app.tools.sql_tool import SQLTool
 
@@ -27,5 +28,6 @@ class ToolRegistry:
         registry.register(GroupByTool())
         registry.register(StatsTool())
         registry.register(TrendTool())
+        registry.register(DataQualityTool())
         registry.register(SQLTool())
         return registry

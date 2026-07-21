@@ -28,7 +28,36 @@ class PandasExecutionService:
 
     def __init__(self, registry: ToolRegistry | None = None) -> None:
         self.registry = registry or ToolRegistry.with_default_tools()
+        self.task_type_tools = {
+            "data_quality_analysis": "data_quality_tool",
+            "sql": "sql_tool",
+            "trend": "trend_tool",
+            "groupby": "groupby_tool",
+            "stats": "stats_tool",
+        }
         self.task_tool_mappings = (
+            TaskToolMapping(
+                tool_name="data_quality_tool",
+                keywords=(
+                    "data quality",
+                    "quality",
+                    "missing",
+                    "duplicate",
+                    "reliable",
+                    "reliability",
+                    "outlier",
+                    "constant column",
+                    "id column",
+                    "数据质量",
+                    "缺失",
+                    "重复",
+                    "异常值",
+                    "字段质量",
+                    "有没有问题",
+                    "是否可靠",
+                    "分析前",
+                ),
+            ),
             TaskToolMapping(
                 tool_name="sql_tool",
                 keywords=("select ", "group by", "order by", "sql"),
@@ -47,7 +76,6 @@ class PandasExecutionService:
                     "summary",
                     "statistics",
                     "distribution",
-                    "quality",
                     "top",
                     "highest",
                     "lowest",
@@ -82,14 +110,8 @@ class PandasExecutionService:
 
     def _resolve_tool_name(self, task: AnalysisTask) -> str:
         """Explicitly map a task to one registered tool."""
-        if task.type == "sql":
-            return "sql_tool"
-        if task.type == "trend":
-            return "trend_tool"
-        if task.type == "groupby":
-            return "groupby_tool"
-        if task.type == "stats":
-            return "stats_tool"
+        if task.type in self.task_type_tools:
+            return self.task_type_tools[task.type]
         task_text = self._task_text(task)
         for mapping in self.task_tool_mappings:
             if mapping.matches(task_text):

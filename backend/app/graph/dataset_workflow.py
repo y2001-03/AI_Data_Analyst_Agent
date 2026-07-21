@@ -360,6 +360,8 @@ class DatasetGraphNodes:
             ).lower()
             for task in tasks
         ]
+        if any(task.type == "data_quality_analysis" for task in tasks):
+            return tasks
         visualization_keywords = ("chart", "visual", "trend", "group", "segment", "plot")
         if any(any(keyword in text for keyword in visualization_keywords) for text in task_texts):
             return tasks

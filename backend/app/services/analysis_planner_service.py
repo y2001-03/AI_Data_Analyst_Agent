@@ -101,6 +101,15 @@ class AnalysisPlannerService:
             "Prefer 1~3 tasks only. "
             "Must include chart task if trend or comparison exists. "
             "Must use dataset columns only. "
+            "Available deterministic tools: "
+            "data_quality_analysis checks dataset reliability before formal analysis, including row/column counts, "
+            "missing values, duplicate rows, uniqueness, constant columns, possible ID columns, IQR numeric outlier "
+            "counts, quality issues, and a generic heuristic quality score; choose it when users ask to check data "
+            "quality, whether data has problems, missing values, duplicate data, poor-quality fields, or to inspect "
+            "the data before analysis. "
+            "stats summarizes numeric distributions or ranks records. "
+            "groupby compares metrics across categorical segments. "
+            "trend analyzes time/date based changes. "
             "When SQL is the most natural expression, you may output a task with type sql. "
             "For SQL tasks, use table name dataset and only generate safe SELECT queries. "
             "Output JSON only. "
@@ -178,6 +187,11 @@ class AnalysisPlannerService:
             return f"Grouped comparison using {columns_text}."
         if task_type == "sql":
             return "SQL query result against table dataset."
+        if task_type == "data_quality_analysis":
+            return (
+                "Structured data quality report with missing values, duplicate rows, uniqueness, "
+                "constant columns, possible ID columns, IQR outlier counts, issues, and quality score."
+            )
         if task_type == "chart":
             return f"Visualization output using {columns_text}."
         return f"Summary statistics using {columns_text}."
@@ -195,6 +209,11 @@ class AnalysisPlannerService:
         primary_column = file_info.columns[0].name if file_info.columns else "primary field"
         lowered_question = (question or "").lower()
         if question:
+            quality_tokens = (
+                "data quality", "quality", "missing", "duplicate", "duplicates",
+                "reliable", "reliability", "outlier", "constant column", "id column",
+                "数据质量", "缺失", "重复", "异常值", "字段质量", "有没有问题", "是否可靠", "分析前",
+            )
             trend_tokens = (
                 "trend", "monthly", "weekly", "daily", "date", "time",
                 "趋势", "趋势图", "时间", "日期", "按天", "按周", "按月", "变化",
@@ -203,6 +222,19 @@ class AnalysisPlannerService:
                 "by", "segment", "category", "product", "region", "group",
                 "分组", "按", "产品", "类别", "地区", "对比", "统计",
             )
+            if any(token in lowered_question for token in quality_tokens):
+                return [
+                    AnalysisTask(
+                        task_name="Question-Focused Data Quality Analysis",
+                        reasoning=f"Check dataset reliability for the user's question: {question}",
+                        expected_output=(
+                            "Structured data quality report covering missing values, duplicates, "
+                            "uniqueness, constant columns, possible ID columns, outliers, issues, and score."
+                        ),
+                        type="data_quality_analysis",
+                        params={},
+                    ),
+                ]
             if any(token in lowered_question for token in trend_tokens):
                 return [
                     AnalysisTask(
@@ -257,8 +289,8 @@ class AnalysisPlannerService:
             AnalysisTask(
                 task_name="Data Quality Review",
                 reasoning="Confirm the dataset is complete and reliable before deeper analysis.",
-                expected_output=f"Missing value and uniqueness summary for {primary_column}.",
-                type="stats",
+                expected_output=f"Data quality report covering missing values and uniqueness for {primary_column}.",
+                type="data_quality_analysis",
                 params={"focus_column": primary_column},
             ),
             AnalysisTask(
