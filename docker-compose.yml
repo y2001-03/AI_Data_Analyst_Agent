@@ -31,6 +31,7 @@ services:
       APP_PORT: 8000
       DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/ai_data_analyst
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-qwen}
       LLM_MODEL: ${LLM_MODEL:-qwen-plus}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-v3}
     depends_on:

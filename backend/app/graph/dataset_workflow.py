@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from starlette.datastructures import UploadFile
 from langgraph.graph import END, START, StateGraph
 
 from app.core.exceptions import AppException
+from app.core.logging import get_logger
 from app.graph.dataset_state import DatasetGraphState
 from app.schemas.file import AIAnalysisResult, AnalysisTask, ExecutionResult
 from app.schemas.file import ExecutionChart
@@ -18,6 +20,8 @@ from app.services.analysis_planner_service import AnalysisPlannerService
 from app.services.data_understanding_service import DataUnderstandingService
 from app.services.file_service import FileService
 from app.services.pandas_execution_service import PandasExecutionService
+
+logger = get_logger(__name__)
 
 
 class DatasetGraphNodes:
@@ -31,6 +35,8 @@ class DatasetGraphNodes:
 
     async def understand(self, state: DatasetGraphState) -> DatasetGraphState:
         """Parse the upload and generate AI understanding."""
+        node_start = time.monotonic()
+        logger.info("Node started | node=understand file_name=%s", state.get("file_name"))
         memory_context = state.get("memory_context")
         effective_question = state.get("question")
         if not effective_question and isinstance(memory_context, dict):
@@ -66,6 +72,11 @@ class DatasetGraphNodes:
                 input_summary=input_summary,
                 output_summary={"reason": exc.message},
             )
+            logger.warning(
+                "Node failed | node=understand duration=%.0fms error=%s",
+                (time.monotonic() - node_start) * 1000,
+                exc.message,
+            )
             return state
         except Exception as exc:
             state["error_stage"] = "understand"
@@ -77,6 +88,11 @@ class DatasetGraphNodes:
                 input_summary=input_summary,
                 output_summary={"reason": str(exc)},
             )
+            logger.error(
+                "Node failed | node=understand duration=%.0fms error=%s",
+                (time.monotonic() - node_start) * 1000,
+                str(exc),
+            )
             return state
         state["file_info"] = file_info
         state["schema"] = [column.model_dump() for column in file_info.columns]
@@ -85,10 +101,11 @@ class DatasetGraphNodes:
             state["fallback_used"] = True
             if not state["fallback_reason"]:
                 state["fallback_reason"] = fallback_reason or "timeout"
+        node_status = "fallback" if fallback_used else "success"
         self._record_trace(
             state,
             node="understand",
-            status="fallback" if fallback_used else "success",
+            status=node_status,
             input_summary=input_summary,
             output_summary={
                 "row_count": file_info.row_count,
@@ -97,10 +114,18 @@ class DatasetGraphNodes:
                 "fallback_reason": fallback_reason,
             },
         )
+        logger.info(
+            "Node completed | node=understand status=%s duration=%.0fms fallback=%s",
+            node_status,
+            (time.monotonic() - node_start) * 1000,
+            fallback_used,
+        )
         return state
 
     def plan(self, state: DatasetGraphState) -> DatasetGraphState:
         """Generate planned analysis tasks."""
+        node_start = time.monotonic()
+        logger.info("Node started | node=plan")
         if state["error_stage"] or not state["file_info"] or not state["ai_analysis"]:
             self._record_trace(
                 state,
@@ -109,6 +134,7 @@ class DatasetGraphNodes:
                 input_summary={"reason": "understand_failed_or_missing_inputs"},
                 output_summary={},
             )
+            logger.info("Node skipped | node=plan reason=missing_inputs")
             return state
         input_summary = {
             "question": state.get("question"),
@@ -147,6 +173,12 @@ class DatasetGraphNodes:
                 input_summary=input_summary,
                 output_summary={"reason": exc.message, "task_count": len(state["tasks"])},
             )
+            logger.warning(
+                "Node fallback | node=plan duration=%.0fms error=%s task_count=%d",
+                (time.monotonic() - node_start) * 1000,
+                exc.message,
+                len(state["tasks"]),
+            )
             return state
         except Exception as exc:
             state["planner_failed"] = True
@@ -167,6 +199,12 @@ class DatasetGraphNodes:
                 input_summary=input_summary,
                 output_summary={"reason": str(exc), "task_count": len(state["tasks"])},
             )
+            logger.error(
+                "Node fallback | node=plan duration=%.0fms error=%s task_count=%d",
+                (time.monotonic() - node_start) * 1000,
+                str(exc),
+                len(state["tasks"]),
+            )
             return state
         state["tasks"] = tasks
         state["tasks"] = self._ensure_visualization_task(state["file_info"], state["tasks"])
@@ -184,10 +222,18 @@ class DatasetGraphNodes:
             input_summary=input_summary,
             output_summary={"task_count": len(state["tasks"])},
         )
+        logger.info(
+            "Node completed | node=plan status=%s duration=%.0fms task_count=%d",
+            status,
+            (time.monotonic() - node_start) * 1000,
+            len(state["tasks"]),
+        )
         return state
 
     def execute(self, state: DatasetGraphState) -> DatasetGraphState:
         """Execute planned tasks with pandas."""
+        node_start = time.monotonic()
+        logger.info("Node started | node=execute")
         if state["error_stage"] == "understand" or not state["tasks"]:
             self._record_trace(
                 state,
@@ -196,6 +242,7 @@ class DatasetGraphNodes:
                 input_summary={"reason": "no_tasks_or_understand_failed"},
                 output_summary={},
             )
+            logger.info("Node skipped | node=execute reason=no_tasks_or_understand_failed")
             return state
         input_summary = {"task_count": len(state["tasks"])}
         try:
@@ -211,6 +258,11 @@ class DatasetGraphNodes:
                 input_summary=input_summary,
                 output_summary={"result_count": len(result.execution_results)},
             )
+            logger.info(
+                "Node completed | node=execute status=success duration=%.0fms result_count=%d",
+                (time.monotonic() - node_start) * 1000,
+                len(result.execution_results),
+            )
         except AppException as exc:
             state["execution_failed"] = True
             state["execution_results"] = [self._skipped_execution_result(exc.message)]
@@ -221,6 +273,11 @@ class DatasetGraphNodes:
                 input_summary=input_summary,
                 output_summary={"reason": exc.message},
             )
+            logger.warning(
+                "Node failed | node=execute duration=%.0fms error=%s",
+                (time.monotonic() - node_start) * 1000,
+                exc.message,
+            )
         except Exception as exc:
             state["execution_failed"] = True
             state["execution_results"] = [self._skipped_execution_result(str(exc))]
@@ -230,6 +287,11 @@ class DatasetGraphNodes:
                 status="skipped",
                 input_summary=input_summary,
                 output_summary={"reason": str(exc)},
+            )
+            logger.error(
+                "Node failed | node=execute duration=%.0fms error=%s",
+                (time.monotonic() - node_start) * 1000,
+                str(exc),
             )
         return state
 

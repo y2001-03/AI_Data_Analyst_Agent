@@ -12,6 +12,8 @@ from uuid import uuid4
 from fastapi import HTTPException, UploadFile
 import pandas as pd
 
+from app.core.context import trace_id_var
+from app.core.logging import get_logger
 from app.graph.dataset_workflow import build_dataset_upload_graph
 from app.schemas.file import (
     DatasetExecutionResponse,
@@ -21,6 +23,8 @@ from app.schemas.file import (
     TraceResponse,
 )
 from app.services.dataset_context_service import DatasetContextService
+
+logger = get_logger(__name__)
 
 
 class DatasetFlowService:
@@ -101,6 +105,7 @@ class DatasetFlowService:
             )
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {"reason": str(exc.detail)}
+            logger.warning("SSE stream error | error=%s", detail)
             yield self._format_sse(
                 "error",
                 {
@@ -110,6 +115,7 @@ class DatasetFlowService:
                 },
             )
         except Exception as exc:
+            logger.exception("SSE stream unexpected error")
             yield self._format_sse(
                 "error",
                 {
@@ -162,6 +168,14 @@ class DatasetFlowService:
         on_node_complete: Callable[[dict[str, object] | None], Awaitable[None]] | None = None,
     ) -> dict[str, object]:
         """Execute LangGraph once and return the final graph state."""
+        trace_id = str(uuid4())
+        trace_id_var.set(trace_id)
+        logger.info(
+            "Graph run started | file_name=%s question=%s trace_id=%s",
+            file_name,
+            question is not None,
+            trace_id,
+        )
         initial_state = self._build_initial_state(
             file_name,
             content,
@@ -185,7 +199,9 @@ class DatasetFlowService:
         if on_node_complete is not None:
             await on_node_complete(None)
         if last_values is None:
+            logger.error("Graph stream completed without final state | trace_id=%s", trace_id)
             raise RuntimeError("Graph stream completed without final state.")
+        logger.info("Graph run completed | trace_id=%s", trace_id)
         return last_values
 
     def _raise_stage_error(self, stage: str, reason: str, status_code: int) -> None:

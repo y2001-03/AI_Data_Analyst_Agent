@@ -1,73 +1,78 @@
-"""DashScope client service for dataset understanding."""
+"""Dataset understanding helper — delegates LLM calls to the configured provider.
+
+.. note::
+
+    This module **no longer contains any DashScope SDK or HTTP code**.
+    All LLM transport is handled by the ``LLMProvider`` abstraction in
+    ``app.core.llm``, satisfying the Dependency Inversion Principle.
+"""
 
 from __future__ import annotations
 
 import json
-from urllib import error, request
 
-from app.core.config import get_settings
 from app.core.exceptions import AppException
+from app.core.llm import ChatMessage, get_llm_provider
 from app.schemas.file import DatasetUploadResponse
 
 
 class DashScopeService:
-    """Minimal DashScope chat client."""
+    """Thin wrapper around the LLM provider for dataset understanding.
 
-    endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    Retained for backward compatibility with ``DataUnderstandingService``.
+    All HTTP / auth / retry logic lives in the provider — this class only
+    owns the prompt template and the mock-data fallback (business logic).
+    """
 
     def __init__(self) -> None:
-        self.settings = get_settings()
+        self._provider = get_llm_provider()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def analyze_dataset(self, file_info: DatasetUploadResponse) -> dict[str, object]:
-        """Analyze dataset metadata with DashScope or fallback mock data."""
-        api_key = self.settings.dashscope_api_key
-        if not api_key:
-            return self._mock_response(file_info)
-        prompt = self._build_prompt(file_info)
-        payload = self._build_payload(prompt)
-        req = request.Request(
-            self.endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=self._build_headers(api_key),
-            method="POST",
+        """Analyze dataset metadata via the LLM provider, or return mock data.
+
+        Args:
+            file_info: Parsed dataset metadata from ``FileService``.
+
+        Returns:
+            A dict with keys ``summary`` (str) and ``suggestions`` (list[str]).
+        """
+        messages = [
+            ChatMessage(role="system", content=self._system_prompt()),
+            ChatMessage(role="user", content=self._build_prompt(file_info)),
+        ]
+        try:
+            return self._provider.structured_output(messages)
+        except AppException:
+            raise
+        except Exception as exc:
+            raise AppException(str(exc), 502) from exc
+
+    def _mock_response(self, file_info: DatasetUploadResponse) -> dict[str, object]:
+        """Return deterministic mock output when no API key is configured."""
+        column_names = [column.name for column in file_info.columns[:3]]
+        joined_names = ", ".join(column_names) if column_names else "unknown columns"
+        summary = (
+            f"This {file_info.file_type.upper()} dataset contains "
+            f"{file_info.row_count} rows and {file_info.column_count} columns. "
+            f"Key fields include {joined_names}."
         )
-        try:
-            with request.urlopen(req, timeout=30) as response:
-                body = response.read().decode("utf-8")
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            raise AppException(f"DashScope request failed: {detail}", 502) from exc
-        except error.URLError as exc:
-            raise AppException("DashScope is unreachable.", 502) from exc
-        return self._parse_response(body)
-
-    def _build_payload(self, prompt: str) -> dict[str, object]:
-        """Build the DashScope chat payload."""
+        suggestions = [
+            "Check missing values and outliers in important columns.",
+            "Analyze metric trends by time or category dimensions.",
+            "Compare aggregated statistics across key business fields.",
+        ]
         return {
-            "model": self.settings.llm_model,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": prompt},
-            ],
+            "summary": summary,
+            "suggestions": suggestions,
         }
 
-    def _build_headers(self, api_key: str) -> dict[str, str]:
-        """Build request headers for DashScope."""
-        return {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-    def _parse_response(self, body: str) -> dict[str, object]:
-        """Parse the JSON payload returned by DashScope."""
-        payload = json.loads(body)
-        try:
-            content = payload["choices"][0]["message"]["content"]
-            result = json.loads(content)
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise AppException("DashScope returned an invalid response.", 502) from exc
-        return result
+    # ------------------------------------------------------------------
+    # Prompt templates (business logic — does not belong in the provider)
+    # ------------------------------------------------------------------
 
     def _build_prompt(self, file_info: DatasetUploadResponse) -> str:
         """Serialize dataset metadata into the model prompt."""
@@ -90,22 +95,3 @@ class DashScopeService:
             "summary must be a concise dataset description in Chinese. "
             "suggestions must be an array of 3 to 5 Chinese analysis suggestions."
         )
-
-    def _mock_response(self, file_info: DatasetUploadResponse) -> dict[str, object]:
-        """Return deterministic mock output when no API key is configured."""
-        column_names = [column.name for column in file_info.columns[:3]]
-        joined_names = ", ".join(column_names) if column_names else "unknown columns"
-        summary = (
-            f"This {file_info.file_type.upper()} dataset contains "
-            f"{file_info.row_count} rows and {file_info.column_count} columns. "
-            f"Key fields include {joined_names}."
-        )
-        suggestions = [
-            "Check missing values and outliers in important columns.",
-            "Analyze metric trends by time or category dimensions.",
-            "Compare aggregated statistics across key business fields.",
-        ]
-        return {
-            "summary": summary,
-            "suggestions": suggestions,
-        }

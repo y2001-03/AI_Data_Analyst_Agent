@@ -1,25 +1,40 @@
-"""Analysis planning service."""
+"""Analysis planning service — delegates LLM calls to the configured provider.
+
+.. note::
+
+    This module **no longer contains any DashScope SDK, HTTP, or
+    ``urllib`` code**.  All transport is handled by the ``LLMProvider``
+    abstraction in ``app.core.llm``.
+"""
 
 from __future__ import annotations
 
 import json
-from socket import timeout as SocketTimeout
-from urllib import error, request
 
 from app.core.config import get_settings
 from app.core.exceptions import AppException
+from app.core.llm import ChatMessage, get_llm_provider
 from app.schemas.file import AIAnalysisResult, AnalysisTask, DatasetUploadResponse
 
 
 class AnalysisPlannerService:
-    """Generate structured analysis tasks from dataset understanding."""
+    """Generate structured analysis tasks from dataset understanding.
 
-    endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    Owns the task-planning prompt template and task normalisation logic
+    (business rules).  The actual LLM call is delegated to the configured
+    ``LLMProvider`` so this class is completely vendor-agnostic.
+    """
+
     request_timeout = 12
     max_retries = 2
 
     def __init__(self) -> None:
         self.settings = get_settings()
+        self._provider = get_llm_provider()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def plan_tasks(
         self,
@@ -28,33 +43,29 @@ class AnalysisPlannerService:
         question: str | None = None,
         memory_context: dict[str, object] | None = None,
     ) -> list[AnalysisTask]:
-        """Generate analysis tasks from summary and suggestions."""
+        """Generate analysis tasks from summary and suggestions.
+
+        Falls back to ``_mock_tasks`` when no API key is configured or
+        when the LLM call fails.
+        """
         if not self.settings.dashscope_api_key:
             return self._mock_tasks(file_info, question)
-        payload = self._build_payload(file_info, ai_analysis, question, memory_context)
+
+        messages = [
+            ChatMessage(role="system", content=self._system_prompt()),
+            ChatMessage(role="user", content=self._build_prompt(
+                file_info, ai_analysis, question, memory_context,
+            )),
+        ]
         try:
-            body = self._send_with_retry(payload)
-            return self._parse_tasks(body, file_info)
+            result = self._provider.structured_output(messages)
+            return self._parse_tasks_from_result(result, file_info)
         except Exception:
             return self._mock_tasks(file_info, question)
 
-    def _build_payload(
-        self,
-        file_info: DatasetUploadResponse,
-        ai_analysis: AIAnalysisResult,
-        question: str | None,
-        memory_context: dict[str, object] | None,
-    ) -> dict[str, object]:
-        """Build the planner request payload."""
-        prompt = self._build_prompt(file_info, ai_analysis, question, memory_context)
-        return {
-            "model": self.settings.llm_model,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": self._system_prompt()},
-                {"role": "user", "content": prompt},
-            ],
-        }
+    # ------------------------------------------------------------------
+    # Prompt templates (business logic)
+    # ------------------------------------------------------------------
 
     def _build_prompt(
         self,
@@ -80,51 +91,43 @@ class AnalysisPlannerService:
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    def _send_with_retry(self, payload: dict[str, object]) -> str:
-        """Send the planning request with retry support."""
-        last_error: Exception | None = None
-        for _ in range(self.max_retries + 1):
-            try:
-                return self._send_request(payload)
-            except (error.HTTPError, error.URLError, SocketTimeout, TimeoutError) as exc:
-                last_error = exc
-            except Exception as exc:
-                last_error = exc
-        if last_error is None:
-            raise RuntimeError("Analysis planner failed without an error.")
-        raise last_error
-
-    def _send_request(self, payload: dict[str, object]) -> str:
-        """Send the planning request to DashScope."""
-        req = request.Request(
-            self.endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=self._build_headers(),
-            method="POST",
+    def _system_prompt(self) -> str:
+        """Return the system prompt for task planning."""
+        return (
+            "You are a data analysis planner. "
+            "Given dataset schema + user question: "
+            "Generate a minimal but complete set of analytical tasks. "
+            "Rules: "
+            "Prefer 1~3 tasks only. "
+            "Must include chart task if trend or comparison exists. "
+            "Must use dataset columns only. "
+            "When SQL is the most natural expression, you may output a task with type sql. "
+            "For SQL tasks, use table name dataset and only generate safe SELECT queries. "
+            "Output JSON only. "
+            "Return {\"tasks\": [...]} where each task includes: "
+            "task_name, type, reason, params."
         )
-        with request.urlopen(req, timeout=self.request_timeout) as response:
-            return response.read().decode("utf-8")
 
-    def _build_headers(self) -> dict[str, str]:
-        """Build planner request headers."""
-        return {
-            "Authorization": f"Bearer {self.settings.dashscope_api_key}",
-            "Content-Type": "application/json",
-        }
+    # ------------------------------------------------------------------
+    # Response parsing (business logic)
+    # ------------------------------------------------------------------
 
-    def _parse_tasks(
+    def _parse_tasks_from_result(
         self,
-        body: str,
+        result: dict[str, object],
         file_info: DatasetUploadResponse,
     ) -> list[AnalysisTask]:
-        """Parse tasks from the model response."""
+        """Extract and normalise analysis tasks from the structured LLM output.
+
+        The provider has already parsed the JSON; we validate the expected
+        shape and convert each entry to a domain model.
+        """
         try:
-            payload = json.loads(body)
-            content = payload["choices"][0]["message"]["content"]
-            result = json.loads(content)
             tasks = result["tasks"]
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise AppException("Analysis planner returned invalid tasks.", 502) from exc
+        except KeyError as exc:
+            raise AppException(
+                "Analysis planner returned a response without a 'tasks' key.", 502
+            ) from exc
         parsed = [
             self._normalize_task(task, file_info)
             for task in tasks
@@ -179,22 +182,9 @@ class AnalysisPlannerService:
             return f"Visualization output using {columns_text}."
         return f"Summary statistics using {columns_text}."
 
-    def _system_prompt(self) -> str:
-        """Return the system prompt for task planning."""
-        return (
-            "You are a data analysis planner. "
-            "Given dataset schema + user question: "
-            "Generate a minimal but complete set of analytical tasks. "
-            "Rules: "
-            "Prefer 1~3 tasks only. "
-            "Must include chart task if trend or comparison exists. "
-            "Must use dataset columns only. "
-            "When SQL is the most natural expression, you may output a task with type sql. "
-            "For SQL tasks, use table name dataset and only generate safe SELECT queries. "
-            "Output JSON only. "
-            "Return {\"tasks\": [...]} where each task includes: "
-            "task_name, type, reason, params."
-        )
+    # ------------------------------------------------------------------
+    # Fallback / mock (business logic)
+    # ------------------------------------------------------------------
 
     def _mock_tasks(
         self,
@@ -206,35 +196,12 @@ class AnalysisPlannerService:
         lowered_question = (question or "").lower()
         if question:
             trend_tokens = (
-                "trend",
-                "monthly",
-                "weekly",
-                "daily",
-                "date",
-                "time",
-                "趋势",
-                "趋势图",
-                "时间",
-                "日期",
-                "按天",
-                "按周",
-                "按月",
-                "变化",
+                "trend", "monthly", "weekly", "daily", "date", "time",
+                "趋势", "趋势图", "时间", "日期", "按天", "按周", "按月", "变化",
             )
             group_tokens = (
-                "by",
-                "segment",
-                "category",
-                "product",
-                "region",
-                "group",
-                "分组",
-                "按",
-                "产品",
-                "类别",
-                "地区",
-                "对比",
-                "统计",
+                "by", "segment", "category", "product", "region", "group",
+                "分组", "按", "产品", "类别", "地区", "对比", "统计",
             )
             if any(token in lowered_question for token in trend_tokens):
                 return [

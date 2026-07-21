@@ -54,7 +54,7 @@ class DataUnderstandingService:
         last_reason: str | None = None
         for _ in range(self.max_retries + 1):
             try:
-                result = self._call_dashscope_with_timeout(file_info)
+                result = self._call_llm_with_timeout(file_info)
                 ai_analysis = self._build_ai_analysis(result)
                 return self._apply_memory_focus(
                     self._apply_question_focus(ai_analysis, effective_question),
@@ -124,11 +124,11 @@ class DataUnderstandingService:
         last_question = memory_context.get("last_question")
         return last_question if isinstance(last_question, str) and last_question else None
 
-    def _call_dashscope_with_timeout(
+    def _call_llm_with_timeout(
         self,
         file_info: DatasetUploadResponse,
     ) -> dict[str, object]:
-        """Call DashScope with a bounded timeout."""
+        """Call the LLM provider with a bounded timeout."""
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self.dashscope_service.analyze_dataset, file_info)
             return future.result(timeout=self.request_timeout)
@@ -138,12 +138,12 @@ class DataUnderstandingService:
         summary = result.get("summary")
         suggestions = result.get("suggestions")
         if not isinstance(summary, str):
-            raise AppException("DashScope response is missing summary.", 502)
+            raise AppException("LLM response is missing summary.", 502)
         if not isinstance(suggestions, list):
-            raise AppException("DashScope response is missing suggestions.", 502)
+            raise AppException("LLM response is missing suggestions.", 502)
         normalized = [item for item in suggestions if isinstance(item, str)]
         if not normalized:
-            raise AppException("DashScope suggestions are invalid.", 502)
+            raise AppException("LLM suggestions are invalid.", 502)
         return AIAnalysisResult(summary=summary, suggestions=normalized, tasks=[])
 
     def _build_rule_based_analysis(
