@@ -13,8 +13,16 @@ from fastapi import HTTPException, UploadFile
 import pandas as pd
 
 from app.core.context import trace_id_var
+from app.core.database import create_async_session
 from app.core.logging import get_logger
 from app.graph.dataset_workflow import build_dataset_upload_graph
+from app.models.analysis import AnalysisResult, AnalysisSession
+from app.models.dataset import Dataset
+from app.repositories.analysis_repository import (
+    AnalysisResultRepository,
+    AnalysisSessionRepository,
+)
+from app.repositories.dataset_repository import DatasetRepository
 from app.schemas.file import (
     DatasetExecutionResponse,
     DebugFallbackSummary,
@@ -45,7 +53,10 @@ class DatasetFlowService:
     ) -> DatasetExecutionResponse:
         """Execute the full upload flow without streaming."""
         result, dataset_id = await self.unified_run_graph(file, session_id=session_id)
-        return self._build_response(result, dataset_id=dataset_id)
+        response = self._build_response(result, dataset_id=dataset_id)
+        # Persist to database (fire-and-forget — never fails the response).
+        await self._persist_dataset(file, result, dataset_id)
+        return response
 
     async def chat_upload_flow(
         self,
@@ -61,6 +72,15 @@ class DatasetFlowService:
         if not resolved_dataset_id:
             self._raise_stage_error("understand", "No dataset_id was provided and no recent dataset exists for this session.", 400)
         dataset = self.dataset_context_service.get_dataset(resolved_dataset_id)
+
+        # Create analysis session record before running the graph.
+        analysis_session = AnalysisSession(
+            dataset_id=resolved_dataset_id,
+            question=question,
+            status="running",
+        )
+        await self._persist_session(analysis_session)
+
         result = await self._run_graph(
             file_name=dataset.file_name,
             content=dataset.content,
@@ -68,7 +88,11 @@ class DatasetFlowService:
             memory_context=memory_context,
             dataframe=dataset.dataframe.copy(),
         )
-        return self._build_response(result, dataset_id=resolved_dataset_id)
+        response = self._build_response(result, dataset_id=resolved_dataset_id)
+
+        # Persist analysis result and mark session completed.
+        await self._persist_result(analysis_session.id, response)
+        return response
 
     async def stream_upload_flow(self, file: UploadFile) -> AsyncIterator[str]:
         """Stream node progress and emit the final JSON payload."""
@@ -210,6 +234,89 @@ class DatasetFlowService:
             status_code=status_code,
             detail={"stage": stage, "reason": reason},
         )
+
+    # ------------------------------------------------------------------
+    # Persistence helpers (fire-and-forget — never fail the response)
+    # ------------------------------------------------------------------
+
+    async def _persist_dataset(
+        self,
+        file: UploadFile,
+        result: dict[str, object],
+        dataset_id: str,
+    ) -> None:
+        """Save dataset metadata to PostgreSQL."""
+        try:
+            file_info = result.get("file_info")
+            db = create_async_session()
+            try:
+                repo = DatasetRepository(db)
+                dataset = Dataset(
+                    id=dataset_id,
+                    filename=file.filename or "unknown",
+                    file_size=getattr(file, "size", 0) or 0,
+                    file_type=(file.filename or "unknown").rsplit(".", 1)[-1]
+                    if file.filename
+                    else "csv",
+                    row_count=file_info.row_count if file_info is not None else 0,
+                    column_count=file_info.column_count if file_info is not None else 0,
+                    schema_info=[c.model_dump(mode="json") for c in file_info.columns]
+                    if file_info is not None and file_info.columns
+                    else None,
+                )
+                await repo.create(dataset)
+                await db.commit()
+                logger.info("Dataset persisted | id=%s filename=%s", dataset_id, dataset.filename)
+            finally:
+                await db.close()
+        except Exception:
+            logger.exception("Failed to persist dataset | id=%s", dataset_id)
+
+    async def _persist_session(self, session: AnalysisSession) -> None:
+        """Create an analysis session record."""
+        try:
+            db = create_async_session()
+            try:
+                repo = AnalysisSessionRepository(db)
+                await repo.create(session)
+                await db.commit()
+                logger.info(
+                    "Analysis session created | id=%s dataset_id=%s status=%s",
+                    session.id,
+                    session.dataset_id,
+                    session.status,
+                )
+            finally:
+                await db.close()
+        except Exception:
+            logger.exception("Failed to persist analysis session | id=%s", session.id)
+
+    async def _persist_result(
+        self,
+        session_id: str,
+        response: DatasetExecutionResponse,
+    ) -> None:
+        """Save analysis result and mark the session as completed."""
+        try:
+            db = create_async_session()
+            try:
+                session_repo = AnalysisSessionRepository(db)
+                result_repo = AnalysisResultRepository(db)
+
+                analysis_result = AnalysisResult(
+                    session_id=session_id,
+                    result=response.model_dump(mode="json"),
+                )
+                await result_repo.create(analysis_result)
+                await session_repo.mark_completed(session_id)
+                await db.commit()
+                logger.info(
+                    "Analysis result persisted | session_id=%s", session_id,
+                )
+            finally:
+                await db.close()
+        except Exception:
+            logger.exception("Failed to persist analysis result | session_id=%s", session_id)
 
     def _build_initial_state(
         self,
