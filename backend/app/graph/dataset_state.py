@@ -26,6 +26,12 @@ class DatasetGraphState(TypedDict):
     execution_order: list[str]
     dependency_count: int
     execution_supported: bool
+    task_execution_records: list[dict[str, object]]
+    stage_execution_records: list[dict[str, object]]
+    execution_summary: dict[str, object] | None
+    failed_task_ids: list[str]
+    blocked_task_ids: list[str]
+    confirmation_required_task_ids: list[str]
     execution_results: list[ExecutionResult]
     planner_failed: bool
     execution_failed: bool

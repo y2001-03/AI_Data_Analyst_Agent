@@ -16,8 +16,10 @@ from app.core.logging import get_logger
 from app.graph.dataset_state import DatasetGraphState
 from app.schemas.file import AIAnalysisResult, AnalysisTask, ExecutionResult
 from app.schemas.file import ExecutionChart
+from app.schemas.planner_contract import PlannerPlan
 from app.services.analysis_planner_service import AnalysisPlannerService
 from app.services.data_understanding_service import DataUnderstandingService
+from app.services.dependency_execution_service import DependencyAwareExecutionService
 from app.services.file_service import FileService
 from app.services.pandas_execution_service import PandasExecutionService
 
@@ -32,6 +34,7 @@ class DatasetGraphNodes:
         self.data_understanding_service = DataUnderstandingService()
         self.analysis_planner_service = AnalysisPlannerService()
         self.execution_service = PandasExecutionService()
+        self.dependency_execution_service = DependencyAwareExecutionService(self.execution_service)
 
     async def understand(self, state: DatasetGraphState) -> DatasetGraphState:
         """Parse the upload and generate AI understanding."""
@@ -308,14 +311,30 @@ class DatasetGraphNodes:
             dataframe = state.get("dataframe")
             if dataframe is None:
                 dataframe = self._load_dataframe(state["file_name"], state["content"])
-            result = self.execution_service.execute_tasks(dataframe, state["tasks"])
+            planner_plan_payload = state.get("planner_plan")
+            if not isinstance(planner_plan_payload, dict):
+                raise RuntimeError("PlannerPlan is missing from graph state.")
+            planner_plan = PlannerPlan.model_validate(planner_plan_payload)
+            coordinator = getattr(
+                self,
+                "dependency_execution_service",
+                DependencyAwareExecutionService(self.execution_service),
+            )
+            result = coordinator.execute_plan(dataframe, planner_plan, state["tasks"])
             state["execution_results"] = result.execution_results
+            self._store_dependency_execution(state, result)
             self._record_trace(
                 state,
                 node="execute",
                 status="success",
                 input_summary=input_summary,
-                output_summary={"result_count": len(result.execution_results)},
+                output_summary={
+                    "result_count": len(result.execution_results),
+                    "execution_summary": result.summary.model_dump(mode="json"),
+                    "stage_count": len(result.stage_records),
+                    "completed_tasks": result.summary.succeeded_tasks,
+                    "total_tasks": result.summary.total_tasks,
+                },
             )
             logger.info(
                 "Node completed | node=execute status=success duration=%.0fms result_count=%d",
@@ -402,6 +421,23 @@ class DatasetGraphNodes:
         state["execution_order"] = list(planner_plan.execution_order)
         state["dependency_count"] = planner_plan.diagnostics.dependency_count
         state["execution_supported"] = planner_plan.execution_supported
+
+    def _store_dependency_execution(self, state: DatasetGraphState, result) -> None:
+        """Store JSON-safe dependency execution records in graph state."""
+        task_records = [record.model_dump(mode="json") for record in result.task_records]
+        stage_records = [record.model_dump(mode="json") for record in result.stage_records]
+        state["task_execution_records"] = task_records
+        state["stage_execution_records"] = stage_records
+        state["execution_summary"] = result.summary.model_dump(mode="json")
+        state["failed_task_ids"] = [
+            record["task_id"] for record in task_records if record["status"] == "failed"
+        ]
+        state["blocked_task_ids"] = [
+            record["task_id"] for record in task_records if record["status"] == "blocked"
+        ]
+        state["confirmation_required_task_ids"] = [
+            record["task_id"] for record in task_records if record["status"] == "confirmation_required"
+        ]
 
     def _skipped_execution_result(self, reason: str) -> ExecutionResult:
         """Return a graph-level skipped execution result."""
