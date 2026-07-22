@@ -110,6 +110,14 @@ class AnalysisPlannerService:
             "time_column, value_columns, threshold, iqr_multiplier, and window. It already returns bounded chart "
             "data, so do not add a separate chart task. Requests to clean or delete anomalies must still produce "
             "detection only; anomalies are not automatically data errors. "
+            "distribution_analysis describes numeric, categorical, or group-comparison distributions without "
+            "changing data or making causal claims. Choose it for distributions, quantiles, histograms, boxplot "
+            "summaries, skewness, kurtosis, long-tail descriptions, category frequencies, entropy, rare categories, "
+            "high cardinality, or descriptive distribution comparisons across groups. Supported modes are numeric, "
+            "categorical, and group_comparison. Params may include columns, group_by, bins, top_k, quantiles, and "
+            "allow_low_cardinality_numeric. It already returns bounded chart data, so do not add a separate chart "
+            "task. Distribution labels are descriptive heuristics, not formal normality tests, anomaly conclusions, "
+            "data-quality errors, or evidence of causation. "
             "correlation_analysis calculates a Pearson or Spearman correlation matrix for numeric fields, "
             "pair sample sizes, reliable strong relationships, and heuristic multicollinearity risks. Choose it "
             "for correlation, association, Pearson, Spearman, or multicollinearity requests. Its params may contain "
@@ -189,6 +197,14 @@ class AnalysisPlannerService:
                 "rolling_zscore" if mode == "time_series" else "iqr",
             )
             params["detection_only"] = True
+        if task_type == "distribution_analysis":
+            params = dict(params)
+            if "mode" not in params:
+                params["mode"] = (
+                    "numeric"
+                    if any(self._profile_is_numeric(profile) for profile in file_info.columns)
+                    else "categorical"
+                )
         if task_type == "correlation_analysis":
             params = dict(params)
             params.setdefault("method", "pearson")
@@ -225,6 +241,11 @@ class AnalysisPlannerService:
             return (
                 f"Bounded, explainable candidate anomaly records and chart data using {columns_text}; "
                 "detection only, with no automatic deletion or replacement."
+            )
+        if task_type == "distribution_analysis":
+            return (
+                f"Descriptive distribution statistics and bounded chart data using {columns_text}; "
+                "heuristic labels only, with no formal normality test, data modification, or causal claims."
             )
         if task_type == "correlation_analysis":
             return (
@@ -274,6 +295,13 @@ class AnalysisPlannerService:
                 "correlation", "correlate", "association", "relationship", "pearson", "spearman",
                 "multicollinearity", "相关", "关联", "相关系数", "共线性", "的关系", "受什么影响",
                 "影响因素",
+            )
+            distribution_tokens = (
+                "distribution", "frequency", "histogram", "boxplot", "box plot", "quantile",
+                "percentile", "skewness", "kurtosis", "long tail", "entropy", "cardinality",
+                "分布", "频数", "频率", "分位数", "百分位", "偏度", "峰度", "直方图",
+                "箱线图", "长尾", "零值很多", "类别占比", "哪个渠道最多", "高基数",
+                "稀有类别", "很少见", "信息熵",
             )
             cleaning_plan_tokens = (
                 "cleaning plan", "cleaning advice", "how to clean", "should clean", "should i",
@@ -343,6 +371,23 @@ class AnalysisPlannerService:
                             "multicollinearity risks, and heatmap data; correlation does not imply causation."
                         ),
                         type="correlation_analysis",
+                        params=params,
+                    ),
+                ]
+            if any(token in lowered_question for token in distribution_tokens):
+                params = self._fallback_distribution_params(file_info, lowered_question)
+                return [
+                    AnalysisTask(
+                        task_name="Question-Focused Distribution Analysis",
+                        reasoning=(
+                            "Describe the requested distribution with bounded statistics and heuristic labels "
+                            "without changing source data or making causal claims."
+                        ),
+                        expected_output=(
+                            "Descriptive numeric, categorical, or grouped distribution statistics and chart data; "
+                            "no formal normality test, automatic cleaning, or causal conclusion."
+                        ),
+                        type="distribution_analysis",
                         params=params,
                     ),
                 ]
@@ -563,6 +608,7 @@ class AnalysisPlannerService:
             "区域": ("region", "area", "location"),
             "类别": ("category", "type"),
             "产品": ("product", "product_name"),
+            "渠道": ("channel",),
         }
         for token, names in aliases.items():
             if token in question:
@@ -634,6 +680,101 @@ class AnalysisPlannerService:
         if not match:
             match = re.search(r"(\d+)\s*(?:day|days|天)?\s*滚动", question)
         return int(match.group(1)) if match else None
+
+    def _fallback_distribution_params(
+        self,
+        file_info: DatasetUploadResponse,
+        question: str,
+    ) -> dict[str, object]:
+        """Extract deterministic descriptive distribution options from a request."""
+        mentioned = [
+            profile.name
+            for profile in file_info.columns
+            if self._question_mentions_column(question, profile.name)
+        ]
+        numeric = [
+            profile.name for profile in file_info.columns if self._profile_is_numeric(profile)
+        ]
+        group_by = self._fallback_group_by(file_info, question, mentioned)
+        comparison_tokens = (
+            "compare", "comparison", "difference", "different groups", "across groups",
+            "比较", "对比", "差异", "不同组", "各组", "不同地区", "不同渠道",
+        )
+        categorical_tokens = (
+            "frequency", "category", "categories", "most common", "entropy", "cardinality",
+            "频数", "频率", "类别", "占比", "哪个渠道最多", "高基数", "稀有类别",
+            "很少见", "信息熵", "各地区数量",
+        )
+        mentioned_numeric = [column for column in mentioned if column in numeric]
+        if (
+            group_by
+            and mentioned_numeric
+            and any(token in question for token in comparison_tokens)
+        ):
+            mode = "group_comparison"
+        elif any(token in question for token in categorical_tokens) or (
+            group_by and not mentioned_numeric and "分布" in question
+        ):
+            mode = "categorical"
+        else:
+            mode = "numeric" if numeric else "categorical"
+
+        params: dict[str, object] = {"mode": mode}
+        if mode == "group_comparison":
+            params["group_by"] = group_by
+            columns = [column for column in mentioned_numeric if column != group_by]
+            if columns:
+                params["columns"] = columns
+        elif mode == "categorical":
+            columns = [column for column in mentioned if column not in numeric]
+            if not columns and group_by and group_by not in numeric:
+                columns = [group_by]
+            if columns:
+                params["columns"] = columns
+            params["allow_low_cardinality_numeric"] = any(
+                token in question
+                for token in ("low cardinality numeric", "低基数数值", "整数类别")
+            )
+        elif mentioned_numeric:
+            params["columns"] = mentioned_numeric
+
+        bins = self._integer_after_keywords(question, ("bins", "bin", "直方图分箱", "分箱"))
+        if bins is not None and mode == "numeric":
+            params["bins"] = bins
+        top_k = self._integer_after_keywords(question, ("top_k", "top k", "top", "前"))
+        if top_k is not None and mode == "categorical":
+            params["top_k"] = top_k
+        quantiles = self._quantiles_from_question(question)
+        if quantiles and mode == "numeric":
+            params["quantiles"] = quantiles
+        return params
+
+    def _integer_after_keywords(
+        self,
+        question: str,
+        keywords: tuple[str, ...],
+    ) -> int | None:
+        keyword_pattern = "|".join(re.escape(keyword) for keyword in keywords)
+        match = re.search(
+            rf"(?:{keyword_pattern})\s*(?:=|:|为)?\s*(\d+)",
+            question,
+        )
+        return int(match.group(1)) if match else None
+
+    def _quantiles_from_question(self, question: str) -> list[float] | None:
+        match = re.search(
+            r"(?:quantiles?|percentiles?|分位数|百分位)\s*(?:=|:|为)?\s*([\[\]0-9.,%\s]+)",
+            question,
+        )
+        if not match:
+            return None
+        values: list[float] = []
+        for number, percent in re.findall(r"(\d+(?:\.\d+)?)\s*(%)?", match.group(1)):
+            value = float(number)
+            if percent:
+                value /= 100
+            values.append(value)
+        return values or None
 
     def _fallback_correlation_params(
         self,

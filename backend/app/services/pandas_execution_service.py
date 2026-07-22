@@ -29,6 +29,7 @@ class PandasExecutionService:
     def __init__(self, registry: ToolRegistry | None = None) -> None:
         self.registry = registry or ToolRegistry.with_default_tools()
         self.task_type_tools = {
+            "distribution_analysis": "distribution_analysis_tool",
             "anomaly_detection": "anomaly_detection_tool",
             "correlation_analysis": "correlation_analysis_tool",
             "data_cleaning_plan": "data_cleaning_tool",
@@ -71,6 +72,37 @@ class PandasExecutionService:
                     "关联",
                     "相关系数",
                     "共线性",
+                ),
+            ),
+            TaskToolMapping(
+                tool_name="distribution_analysis_tool",
+                keywords=(
+                    "distribution",
+                    "distribution analysis",
+                    "numeric distribution",
+                    "category distribution",
+                    "frequency distribution",
+                    "histogram",
+                    "boxplot",
+                    "box plot",
+                    "quantile",
+                    "percentile",
+                    "skewness",
+                    "kurtosis",
+                    "long tail",
+                    "entropy",
+                    "分布",
+                    "分布分析",
+                    "数值分布",
+                    "类别分布",
+                    "频数",
+                    "分位数",
+                    "偏度",
+                    "峰度",
+                    "直方图",
+                    "箱线图",
+                    "长尾",
+                    "信息熵",
                 ),
             ),
             TaskToolMapping(
@@ -128,7 +160,6 @@ class PandasExecutionService:
                 keywords=(
                     "summary",
                     "statistics",
-                    "distribution",
                     "top",
                     "highest",
                     "lowest",

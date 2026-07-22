@@ -7,6 +7,7 @@ from app.tools.correlation_analysis_tool import CorrelationAnalysisTool
 from app.tools.data_cleaning_tool import DataCleaningTool
 from app.tools.data_quality_tool import DataQualityTool
 from app.tools.dataframe_tools import DataframeTool, GroupByTool, StatsTool, TrendTool
+from app.tools.distribution_analysis_tool import DistributionAnalysisTool
 from app.tools.sql_tool import SQLTool
 
 
@@ -33,6 +34,7 @@ class ToolRegistry:
         registry.register(TrendTool())
         registry.register(AnomalyDetectionTool())
         registry.register(CorrelationAnalysisTool())
+        registry.register(DistributionAnalysisTool())
         registry.register(DataQualityTool())
         registry.register(DataCleaningTool())
         registry.register(SQLTool())
