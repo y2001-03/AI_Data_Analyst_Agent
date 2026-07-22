@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from app.core.config import get_settings
 from app.core.exceptions import AppException
@@ -102,6 +103,12 @@ class AnalysisPlannerService:
             "Must include chart task if trend or comparison exists. "
             "Must use dataset columns only. "
             "Available deterministic tools: "
+            "correlation_analysis calculates a Pearson or Spearman correlation matrix for numeric fields, "
+            "pair sample sizes, reliable strong relationships, and heuristic multicollinearity risks. Choose it "
+            "for correlation, association, Pearson, Spearman, or multicollinearity requests. Its params may contain "
+            "columns, method (pearson or spearman), and missing_strategy (pairwise or listwise). Default to Pearson "
+            "and pairwise when unspecified. The task already returns heatmap data, so do not add a separate chart "
+            "task. Do not use causal wording: correlation does not imply causation. "
             "data_quality_analysis checks dataset reliability before formal analysis, including row/column counts, "
             "missing values, duplicate rows, uniqueness, constant columns, possible ID columns, IQR numeric outlier "
             "counts, quality issues, and a generic heuristic quality score; choose it when users ask to check data "
@@ -166,6 +173,10 @@ class AnalysisPlannerService:
         params = task.get("params") if isinstance(task.get("params"), dict) else {}
         if not isinstance(task_name, str) or not isinstance(task_type, str) or not isinstance(reason, str):
             return None
+        if task_type == "correlation_analysis":
+            params = dict(params)
+            params.setdefault("method", "pearson")
+            params.setdefault("missing_strategy", "pairwise")
         expected_output = self._build_expected_output(task_type, params, file_info)
         return AnalysisTask(
             task_name=task_name,
@@ -194,6 +205,11 @@ class AnalysisPlannerService:
             return f"Grouped comparison using {columns_text}."
         if task_type == "sql":
             return "SQL query result against table dataset."
+        if task_type == "correlation_analysis":
+            return (
+                f"Correlation matrix, pair sample sizes, relationship strengths, heuristic "
+                f"multicollinearity risks, and heatmap data using {columns_text}; correlation does not imply causation."
+            )
         if task_type == "data_quality_analysis":
             return (
                 "Structured data quality report with missing values, duplicate rows, uniqueness, "
@@ -223,6 +239,11 @@ class AnalysisPlannerService:
         primary_column = file_info.columns[0].name if file_info.columns else "primary field"
         lowered_question = (question or "").lower()
         if question:
+            correlation_tokens = (
+                "correlation", "correlate", "association", "relationship", "pearson", "spearman",
+                "multicollinearity", "相关", "关联", "相关系数", "共线性", "的关系", "受什么影响",
+                "影响因素",
+            )
             cleaning_plan_tokens = (
                 "cleaning plan", "cleaning advice", "how to clean", "should clean", "should i",
                 "what should", "can i",
@@ -247,6 +268,23 @@ class AnalysisPlannerService:
                 "by", "segment", "category", "product", "region", "group",
                 "分组", "按", "产品", "类别", "地区", "对比", "统计",
             )
+            if any(token in lowered_question for token in correlation_tokens):
+                params = self._fallback_correlation_params(file_info, lowered_question)
+                return [
+                    AnalysisTask(
+                        task_name="Question-Focused Correlation Analysis",
+                        reasoning=(
+                            "Analyze statistical associations among the requested numeric fields without "
+                            "making causal claims."
+                        ),
+                        expected_output=(
+                            "Correlation matrix, pair sample sizes, relationship strengths, heuristic "
+                            "multicollinearity risks, and heatmap data; correlation does not imply causation."
+                        ),
+                        type="correlation_analysis",
+                        params=params,
+                    ),
+                ]
             if any(token in lowered_question for token in cleaning_plan_tokens):
                 return [
                     AnalysisTask(
@@ -361,6 +399,39 @@ class AnalysisPlannerService:
                 params={},
             ),
         ]
+
+    def _fallback_correlation_params(
+        self,
+        file_info: DatasetUploadResponse,
+        question: str,
+    ) -> dict[str, object]:
+        """Extract deterministic correlation options from an explicit user question."""
+        method = "spearman" if any(
+            token in question for token in ("spearman", "排名相关", "秩相关", "单调关系")
+        ) else "pearson"
+        missing_strategy = "listwise" if any(
+            token in question for token in ("listwise", "完整案例", "整行删除")
+        ) else "pairwise"
+        columns = [
+            profile.name
+            for profile in file_info.columns
+            if self._question_mentions_column(question, profile.name)
+        ]
+        params: dict[str, object] = {
+            "method": method,
+            "missing_strategy": missing_strategy,
+        }
+        if columns:
+            params["columns"] = columns
+        return params
+
+    def _question_mentions_column(self, question: str, column: str) -> bool:
+        """Match ASCII column names on identifier boundaries and other names literally."""
+        normalized = column.lower()
+        if re.fullmatch(r"[a-z0-9_]+", normalized):
+            pattern = rf"(?<![a-z0-9_]){re.escape(normalized)}(?![a-z0-9_])"
+            return re.search(pattern, question) is not None
+        return normalized in question
 
     def _fallback_cleaning_actions(
         self,

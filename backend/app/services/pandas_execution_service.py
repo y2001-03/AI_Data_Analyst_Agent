@@ -29,6 +29,7 @@ class PandasExecutionService:
     def __init__(self, registry: ToolRegistry | None = None) -> None:
         self.registry = registry or ToolRegistry.with_default_tools()
         self.task_type_tools = {
+            "correlation_analysis": "correlation_analysis_tool",
             "data_cleaning_plan": "data_cleaning_tool",
             "data_cleaning_execute": "data_cleaning_tool",
             "data_quality_analysis": "data_quality_tool",
@@ -38,6 +39,20 @@ class PandasExecutionService:
             "stats": "stats_tool",
         }
         self.task_tool_mappings = (
+            TaskToolMapping(
+                tool_name="correlation_analysis_tool",
+                keywords=(
+                    "correlation",
+                    "correlation coefficient",
+                    "pearson",
+                    "spearman",
+                    "multicollinearity",
+                    "相关",
+                    "关联",
+                    "相关系数",
+                    "共线性",
+                ),
+            ),
             TaskToolMapping(
                 tool_name="data_cleaning_tool",
                 keywords=(

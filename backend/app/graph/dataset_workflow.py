@@ -361,6 +361,7 @@ class DatasetGraphNodes:
             for task in tasks
         ]
         non_visual_task_types = {
+            "correlation_analysis",
             "data_quality_analysis",
             "data_cleaning_plan",
             "data_cleaning_execute",
