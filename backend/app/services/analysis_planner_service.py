@@ -103,6 +103,13 @@ class AnalysisPlannerService:
             "Must include chart task if trend or comparison exists. "
             "Must use dataset columns only. "
             "Available deterministic tools: "
+            "anomaly_detection identifies candidate statistical anomalies without modifying or deleting data. "
+            "Choose it only for explicit anomaly records, outliers, group-local anomalies, or time-series spikes "
+            "and drops. Supported modes are global, groupwise, and time_series. Supported methods are iqr, zscore, "
+            "robust_zscore, and rolling_zscore, subject to mode compatibility. Params may include columns, group_by, "
+            "time_column, value_columns, threshold, iqr_multiplier, and window. It already returns bounded chart "
+            "data, so do not add a separate chart task. Requests to clean or delete anomalies must still produce "
+            "detection only; anomalies are not automatically data errors. "
             "correlation_analysis calculates a Pearson or Spearman correlation matrix for numeric fields, "
             "pair sample sizes, reliable strong relationships, and heuristic multicollinearity risks. Choose it "
             "for correlation, association, Pearson, Spearman, or multicollinearity requests. Its params may contain "
@@ -173,6 +180,15 @@ class AnalysisPlannerService:
         params = task.get("params") if isinstance(task.get("params"), dict) else {}
         if not isinstance(task_name, str) or not isinstance(task_type, str) or not isinstance(reason, str):
             return None
+        if task_type == "anomaly_detection":
+            params = dict(params)
+            mode = str(params.get("mode", "global")).lower()
+            params["mode"] = mode
+            params.setdefault(
+                "method",
+                "rolling_zscore" if mode == "time_series" else "iqr",
+            )
+            params["detection_only"] = True
         if task_type == "correlation_analysis":
             params = dict(params)
             params.setdefault("method", "pearson")
@@ -205,6 +221,11 @@ class AnalysisPlannerService:
             return f"Grouped comparison using {columns_text}."
         if task_type == "sql":
             return "SQL query result against table dataset."
+        if task_type == "anomaly_detection":
+            return (
+                f"Bounded, explainable candidate anomaly records and chart data using {columns_text}; "
+                "detection only, with no automatic deletion or replacement."
+            )
         if task_type == "correlation_analysis":
             return (
                 f"Correlation matrix, pair sample sizes, relationship strengths, heuristic "
@@ -239,6 +260,16 @@ class AnalysisPlannerService:
         primary_column = file_info.columns[0].name if file_info.columns else "primary field"
         lowered_question = (question or "").lower()
         if question:
+            quality_priority_tokens = (
+                "data quality", "quality overview", "数据质量", "整体质量", "质量概览",
+            )
+            anomaly_tokens = (
+                "anomaly detection", "detect anomaly", "find anomaly", "find outlier", "outlier detection",
+                "outlier", "abnormal record", "unusual record", "spike", "sudden drop",
+                "异常检测", "异常值", "异常点", "异常数据", "异常记录", "不正常记录", "哪些记录不正常",
+                "数据异常", "robust z-score", "robust_zscore", "rolling z-score", "rolling_zscore",
+                "突增", "突降", "突然变化",
+            )
             correlation_tokens = (
                 "correlation", "correlate", "association", "relationship", "pearson", "spearman",
                 "multicollinearity", "相关", "关联", "相关系数", "共线性", "的关系", "受什么影响",
@@ -268,6 +299,36 @@ class AnalysisPlannerService:
                 "by", "segment", "category", "product", "region", "group",
                 "分组", "按", "产品", "类别", "地区", "对比", "统计",
             )
+            if any(token in lowered_question for token in quality_priority_tokens):
+                return [
+                    AnalysisTask(
+                        task_name="Question-Focused Data Quality Analysis",
+                        reasoning="Check overall dataset reliability without locating individual anomaly records.",
+                        expected_output=(
+                            "Structured data quality report covering missing values, duplicates, "
+                            "uniqueness, constant columns, possible ID columns, outliers, issues, and score."
+                        ),
+                        type="data_quality_analysis",
+                        params={},
+                    ),
+                ]
+            if self._has_anomaly_intent(lowered_question, anomaly_tokens):
+                params = self._fallback_anomaly_params(file_info, lowered_question)
+                return [
+                    AnalysisTask(
+                        task_name="Question-Focused Anomaly Detection",
+                        reasoning=(
+                            "Identify explainable candidate statistical anomalies without changing or "
+                            "deleting source data."
+                        ),
+                        expected_output=(
+                            "Bounded anomaly records, thresholds, reliability flags, warnings, and chart data; "
+                            "detection only, with no automatic deletion or replacement."
+                        ),
+                        type="anomaly_detection",
+                        params=params,
+                    ),
+                ]
             if any(token in lowered_question for token in correlation_tokens):
                 params = self._fallback_correlation_params(file_info, lowered_question)
                 return [
@@ -399,6 +460,180 @@ class AnalysisPlannerService:
                 params={},
             ),
         ]
+
+    def _fallback_anomaly_params(
+        self,
+        file_info: DatasetUploadResponse,
+        question: str,
+    ) -> dict[str, object]:
+        """Extract deterministic anomaly detection options from an explicit request."""
+        time_tokens = (
+            "time series", "rolling", "spike", "sudden drop", "时间序列", "滚动", "突增", "突降",
+            "突然变化", "哪些日期",
+        )
+        group_tokens = ("groupwise", " by ", "按", "分组", "哪些地区")
+        if any(token in question for token in time_tokens):
+            mode = "time_series"
+        elif any(token in question for token in group_tokens):
+            mode = "groupwise"
+        else:
+            mode = "global"
+
+        if any(token in question for token in ("rolling_zscore", "rolling z-score", "滚动窗口", "滚动 z")):
+            method = "rolling_zscore"
+        elif any(token in question for token in ("robust_zscore", "robust z-score", "robust zscore", "稳健 z")):
+            method = "robust_zscore"
+        elif any(token in question for token in ("zscore", "z-score", "z score", "标准分")):
+            method = "zscore"
+        elif "iqr" in question or "四分位" in question:
+            method = "iqr"
+        else:
+            method = "rolling_zscore" if mode == "time_series" else "iqr"
+
+        mentioned = [
+            profile.name
+            for profile in file_info.columns
+            if self._question_mentions_column(question, profile.name)
+        ]
+        numeric = [
+            profile.name for profile in file_info.columns if self._profile_is_numeric(profile)
+        ]
+        params: dict[str, object] = {
+            "mode": mode,
+            "method": method,
+            "detection_only": True,
+            "requested_deletion": any(
+                token in question for token in ("delete", "remove", "drop", "clean", "删除", "清理", "清洗")
+            ),
+        }
+
+        if mode == "groupwise":
+            group_by = self._fallback_group_by(file_info, question, mentioned)
+            if group_by:
+                params["group_by"] = group_by
+            value_columns = [column for column in mentioned if column in numeric and column != group_by]
+            if value_columns:
+                params["columns"] = value_columns
+        elif mode == "time_series":
+            time_column = self._fallback_time_column(file_info, mentioned)
+            if time_column:
+                params["time_column"] = time_column
+            value_columns = [column for column in mentioned if column in numeric and column != time_column]
+            if not value_columns:
+                value_columns = [column for column in numeric if column != time_column]
+            if value_columns:
+                params["value_columns"] = value_columns
+        else:
+            value_columns = [column for column in mentioned if column in numeric]
+            if value_columns:
+                params["columns"] = value_columns
+
+        threshold = self._number_after_keywords(question, ("threshold", "阈值"))
+        if threshold is not None and method != "iqr":
+            params["threshold"] = threshold
+        multiplier = self._number_after_keywords(question, ("multiplier", "倍数"))
+        if multiplier is not None and method == "iqr":
+            params["iqr_multiplier"] = multiplier
+        window = self._window_from_question(question)
+        if window is not None and method == "rolling_zscore":
+            params["window"] = window
+        return params
+
+    def _has_anomaly_intent(
+        self,
+        question: str,
+        tokens: tuple[str, ...],
+    ) -> bool:
+        if any(token in question for token in tokens):
+            return True
+        return re.search(r"(?:检查|找出|检测|识别).{0,24}异常", question) is not None
+
+    def _fallback_group_by(
+        self,
+        file_info: DatasetUploadResponse,
+        question: str,
+        mentioned: list[str],
+    ) -> str | None:
+        for profile in file_info.columns:
+            name = profile.name.lower()
+            if re.search(rf"(?:\bby\b|按)\s*{re.escape(name)}", question):
+                return profile.name
+        aliases = {
+            "地区": ("region", "area", "location"),
+            "区域": ("region", "area", "location"),
+            "类别": ("category", "type"),
+            "产品": ("product", "product_name"),
+        }
+        for token, names in aliases.items():
+            if token in question:
+                match = next(
+                    (profile.name for profile in file_info.columns if profile.name.lower() in names),
+                    None,
+                )
+                if match:
+                    return match
+        return next(
+            (
+                column
+                for column in mentioned
+                if not self._profile_is_numeric(
+                    next(profile for profile in file_info.columns if profile.name == column)
+                )
+            ),
+            None,
+        )
+
+    def _fallback_time_column(
+        self,
+        file_info: DatasetUploadResponse,
+        mentioned: list[str],
+    ) -> str | None:
+        mentioned_time = next(
+            (
+                profile.name
+                for profile in file_info.columns
+                if profile.name in mentioned and self._profile_is_datetime(profile)
+            ),
+            None,
+        )
+        if mentioned_time:
+            return mentioned_time
+        return next(
+            (profile.name for profile in file_info.columns if self._profile_is_datetime(profile)),
+            None,
+        )
+
+    def _profile_is_numeric(self, profile) -> bool:
+        data_type = profile.data_type.lower()
+        excluded = ("bool", "date", "time", "object", "string", "category")
+        if any(token in data_type for token in excluded):
+            return False
+        return any(token in data_type for token in ("int", "float", "double", "decimal", "number"))
+
+    def _profile_is_datetime(self, profile) -> bool:
+        data_type = profile.data_type.lower()
+        name = profile.name.lower()
+        return any(token in data_type for token in ("date", "time", "timestamp")) or any(
+            token in name for token in ("date", "time", "日期", "时间")
+        )
+
+    def _number_after_keywords(
+        self,
+        question: str,
+        keywords: tuple[str, ...],
+    ) -> float | None:
+        keyword_pattern = "|".join(re.escape(keyword) for keyword in keywords)
+        match = re.search(
+            rf"(?:{keyword_pattern})\s*(?:=|:|为)?\s*(\d+(?:\.\d+)?)",
+            question,
+        )
+        return float(match.group(1)) if match else None
+
+    def _window_from_question(self, question: str) -> int | None:
+        match = re.search(r"(?:window|窗口)\s*(?:=|:|为)?\s*(\d+)", question)
+        if not match:
+            match = re.search(r"(\d+)\s*(?:day|days|天)?\s*滚动", question)
+        return int(match.group(1)) if match else None
 
     def _fallback_correlation_params(
         self,

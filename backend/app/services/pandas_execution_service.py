@@ -29,6 +29,7 @@ class PandasExecutionService:
     def __init__(self, registry: ToolRegistry | None = None) -> None:
         self.registry = registry or ToolRegistry.with_default_tools()
         self.task_type_tools = {
+            "anomaly_detection": "anomaly_detection_tool",
             "correlation_analysis": "correlation_analysis_tool",
             "data_cleaning_plan": "data_cleaning_tool",
             "data_cleaning_execute": "data_cleaning_tool",
@@ -39,6 +40,25 @@ class PandasExecutionService:
             "stats": "stats_tool",
         }
         self.task_tool_mappings = (
+            TaskToolMapping(
+                tool_name="anomaly_detection_tool",
+                keywords=(
+                    "anomaly detection",
+                    "detect anomaly",
+                    "find anomaly",
+                    "find outlier",
+                    "outlier detection",
+                    "outlier",
+                    "abnormal record",
+                    "spike",
+                    "异常检测",
+                    "异常值",
+                    "异常点",
+                    "异常记录",
+                    "突增",
+                    "突降",
+                ),
+            ),
             TaskToolMapping(
                 tool_name="correlation_analysis_tool",
                 keywords=(
@@ -80,13 +100,11 @@ class PandasExecutionService:
                     "duplicate",
                     "reliable",
                     "reliability",
-                    "outlier",
                     "constant column",
                     "id column",
                     "数据质量",
                     "缺失",
                     "重复",
-                    "异常值",
                     "字段质量",
                     "有没有问题",
                     "是否可靠",

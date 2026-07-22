@@ -1,5 +1,6 @@
 """Tool package."""
 
+from app.tools.anomaly_detection_tool import AnomalyDetectionTool
 from app.tools.correlation_analysis_tool import CorrelationAnalysisTool
 from app.tools.data_cleaning_tool import DataCleaningTool
 from app.tools.data_quality_tool import DataQualityTool
@@ -8,6 +9,7 @@ from app.tools.registry import ToolRegistry
 from app.tools.sql_tool import SQLTool
 
 __all__ = [
+    "AnomalyDetectionTool",
     "CorrelationAnalysisTool",
     "DatasetContext",
     "DataCleaningTool",
