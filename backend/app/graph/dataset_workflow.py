@@ -361,6 +361,7 @@ class DatasetGraphNodes:
             for task in tasks
         ]
         non_visual_task_types = {
+            "forecast_analysis",
             "distribution_analysis",
             "anomaly_detection",
             "correlation_analysis",

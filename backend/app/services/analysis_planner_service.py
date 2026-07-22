@@ -103,6 +103,13 @@ class AnalysisPlannerService:
             "Must include chart task if trend or comparison exists. "
             "Must use dataset columns only. "
             "Available deterministic tools: "
+            "forecast_analysis performs ordered train/validation backtesting and heuristic future forecasts for "
+            "one numeric time series or independent groups. Choose it only for explicit future prediction, "
+            "forecasting, backtesting, or forecast-model comparison requests, not historical trend questions. "
+            "Supported methods are auto, naive, seasonal_naive, moving_average, and linear_trend. Params may "
+            "include mode, time_column, target_column, group_by, horizon, method, window, season_length, "
+            "validation_size, validation_steps, primary_metric, duplicate_time_strategy, aggregation, "
+            "missing_target_strategy, and clip_lower. It returns its own chart data and makes no accuracy guarantee. "
             "anomaly_detection identifies candidate statistical anomalies without modifying or deleting data. "
             "Choose it only for explicit anomaly records, outliers, group-local anomalies, or time-series spikes "
             "and drops. Supported modes are global, groupwise, and time_series. Supported methods are iqr, zscore, "
@@ -197,6 +204,12 @@ class AnalysisPlannerService:
                 "rolling_zscore" if mode == "time_series" else "iqr",
             )
             params["detection_only"] = True
+        if task_type == "forecast_analysis":
+            params = dict(params)
+            params.setdefault("mode", "univariate")
+            params.setdefault("method", "auto")
+            params.setdefault("horizon", 7)
+            params.setdefault("primary_metric", "mae")
         if task_type == "distribution_analysis":
             params = dict(params)
             if "mode" not in params:
@@ -241,6 +254,11 @@ class AnalysisPlannerService:
             return (
                 f"Bounded, explainable candidate anomaly records and chart data using {columns_text}; "
                 "detection only, with no automatic deletion or replacement."
+            )
+        if task_type == "forecast_analysis":
+            return (
+                f"Ordered backtest, baseline model comparison, and bounded heuristic future forecast using "
+                f"{columns_text}; historical patterns do not guarantee future outcomes."
             )
         if task_type == "distribution_analysis":
             return (
@@ -290,6 +308,11 @@ class AnalysisPlannerService:
                 "异常检测", "异常值", "异常点", "异常数据", "异常记录", "不正常记录", "哪些记录不正常",
                 "数据异常", "robust z-score", "robust_zscore", "rolling z-score", "rolling_zscore",
                 "突增", "突降", "突然变化",
+            )
+            forecast_tokens = (
+                "forecast", "forecasting", "predict future", "future prediction", "backtest forecast",
+                "预测未来", "未来预测", "时间序列预测", "根据历史数据预测", "回测预测",
+                "预测模型", "下周会", "下个月会", "未来一个月", "未来几个月",
             )
             correlation_tokens = (
                 "correlation", "correlate", "association", "relationship", "pearson", "spearman",
@@ -354,6 +377,20 @@ class AnalysisPlannerService:
                             "detection only, with no automatic deletion or replacement."
                         ),
                         type="anomaly_detection",
+                        params=params,
+                    ),
+                ]
+            if self._has_forecast_intent(lowered_question, forecast_tokens):
+                params = self._fallback_forecast_params(file_info, lowered_question)
+                return [
+                    AnalysisTask(
+                        task_name="Question-Focused Forecast Analysis",
+                        reasoning="Backtest explainable baseline models before producing a heuristic future forecast.",
+                        expected_output=(
+                            "Ordered backtest, baseline comparison, error metrics, and bounded future forecast; "
+                            "historical patterns do not guarantee future outcomes."
+                        ),
+                        type="forecast_analysis",
                         params=params,
                     ),
                 ]
@@ -680,6 +717,79 @@ class AnalysisPlannerService:
         if not match:
             match = re.search(r"(\d+)\s*(?:day|days|天)?\s*滚动", question)
         return int(match.group(1)) if match else None
+
+    def _has_forecast_intent(self, question: str, tokens: tuple[str, ...]) -> bool:
+        if any(token in question for token in tokens):
+            return True
+        return re.search(r"(?:预测|forecast|backtest|回测).{0,24}(?:未来|模型|效果|sales|销售)", question) is not None
+
+    def _fallback_forecast_params(
+        self,
+        file_info: DatasetUploadResponse,
+        question: str,
+    ) -> dict[str, object]:
+        """Extract conservative baseline-forecast options from explicit intent."""
+        mentioned = [
+            profile.name for profile in file_info.columns
+            if self._question_mentions_column(question, profile.name)
+        ]
+        numeric = [profile.name for profile in file_info.columns if self._profile_is_numeric(profile)]
+        time_column = self._fallback_time_column(file_info, mentioned)
+        target = next((column for column in mentioned if column in numeric and column != time_column), None)
+        if target is None and len(numeric) == 1:
+            target = numeric[0]
+        group_by = self._fallback_group_by(file_info, question, mentioned)
+        grouped = group_by is not None and any(
+            token in question for token in ("grouped", " by ", "按", "分别", "每个", "各地区", "各渠道")
+        )
+        if any(token in question for token in ("moving average", "moving_average", "移动平均")):
+            method = "moving_average"
+        elif any(token in question for token in ("linear trend", "linear_trend", "线性趋势")):
+            method = "linear_trend"
+        elif any(token in question for token in ("seasonal naive", "seasonal_naive", "季节性 naive")):
+            method = "seasonal_naive"
+        elif re.search(r"\bnaive\b|朴素预测", question):
+            method = "naive"
+        else:
+            method = "auto"
+        params: dict[str, object] = {
+            "mode": "grouped" if grouped else "univariate",
+            "method": method,
+            "horizon": self._forecast_horizon(question),
+            "primary_metric": next(
+                (metric for metric in ("rmse", "mape", "smape", "mae") if metric in question),
+                "mae",
+            ),
+        }
+        if time_column: params["time_column"] = time_column
+        if target: params["target_column"] = target
+        if grouped: params["group_by"] = group_by
+        window = self._integer_after_keywords(question, ("window", "窗口"))
+        season = self._integer_after_keywords(question, ("season_length", "season length", "周期"))
+        validation_steps = self._integer_after_keywords(question, ("validation_steps", "validation steps", "验证步数"))
+        validation_size = self._number_after_keywords(question, ("validation_size", "validation size", "验证比例"))
+        clip = self._number_after_keywords(question, ("clip_lower", "clip lower", "下限"))
+        if window is not None: params["window"] = window
+        if season is not None: params["season_length"] = season
+        if validation_steps is not None: params["validation_steps"] = validation_steps
+        elif validation_size is not None: params["validation_size"] = validation_size
+        if clip is not None: params["clip_lower"] = clip
+        for value in ("first", "last", "error", "aggregate"):
+            if value in question and "duplicate" in question: params["duplicate_time_strategy"] = value
+        for value in ("mean", "median", "sum"):
+            if value in question and "aggregate" in question: params["aggregation"] = value
+        for value in ("forward_fill", "interpolate", "drop", "error"):
+            if value in question and "missing" in question: params["missing_target_strategy"] = value
+        return params
+
+    def _forecast_horizon(self, question: str) -> int:
+        explicit = re.search(r"(?:horizon|未来|future)\s*(?:=|:|为)?\s*(\d+)\s*(?:天|day|days|期|步)?", question)
+        if explicit: return int(explicit.group(1))
+        if any(token in question for token in ("下周", "next week")): return 7
+        if any(token in question for token in ("未来一个月", "next month")): return 30
+        match = re.search(r"未来\s*(\d+)\s*个?月", question)
+        if match: return int(match.group(1))
+        return 7
 
     def _fallback_distribution_params(
         self,

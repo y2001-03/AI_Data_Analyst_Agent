@@ -29,6 +29,7 @@ class PandasExecutionService:
     def __init__(self, registry: ToolRegistry | None = None) -> None:
         self.registry = registry or ToolRegistry.with_default_tools()
         self.task_type_tools = {
+            "forecast_analysis": "forecast_analysis_tool",
             "distribution_analysis": "distribution_analysis_tool",
             "anomaly_detection": "anomaly_detection_tool",
             "correlation_analysis": "correlation_analysis_tool",
@@ -41,6 +42,14 @@ class PandasExecutionService:
             "stats": "stats_tool",
         }
         self.task_tool_mappings = (
+            TaskToolMapping(
+                tool_name="forecast_analysis_tool",
+                keywords=(
+                    "forecast", "predict future", "future prediction", "backtest", "forecasting",
+                    "预测未来", "未来预测", "时间序列预测", "回测预测", "预测模型",
+                    "下周会", "下个月会",
+                ),
+            ),
             TaskToolMapping(
                 tool_name="anomaly_detection_tool",
                 keywords=(
@@ -218,6 +227,11 @@ class PandasExecutionService:
                 if inferred_datetime.notna().any():
                     datetime_columns.append(column)
         numeric_columns = dataframe.select_dtypes(include=["number"]).columns.tolist()
+        numeric_columns = [
+            column for column in numeric_columns
+            if not pd.api.types.is_bool_dtype(dataframe[column])
+            and not pd.api.types.is_complex_dtype(dataframe[column])
+        ]
         categorical_columns = [
             column
             for column in dataframe.columns
