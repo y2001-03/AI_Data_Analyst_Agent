@@ -8,6 +8,7 @@ from typing import Protocol
 import pandas as pd
 
 from app.schemas.file import AnalysisTask, ExecutionChart, ExecutionResult
+from app.schemas.tool_capability import ToolCapability
 
 
 @dataclass
@@ -24,6 +25,13 @@ class DataframeTool(Protocol):
 
     name: str
 
+    @property
+    def capability(self) -> ToolCapability:
+        """Return stable read-only capability metadata."""
+
+    def get_capability(self) -> ToolCapability:
+        """Return stable read-only capability metadata."""
+
     def run(
         self,
         dataframe: pd.DataFrame,
@@ -37,6 +45,17 @@ class BaseDataframeTool:
     """Shared utilities for dataframe execution tools."""
 
     name = "base_tool"
+
+    @property
+    def capability(self) -> ToolCapability:
+        """Return a fresh capability value without inspecting data or invoking external services."""
+        from app.tools.capabilities import get_builtin_tool_capability
+
+        return get_builtin_tool_capability(self.name)
+
+    def get_capability(self) -> ToolCapability:
+        """Method form of the read-only capability interface."""
+        return self.capability
 
     def _task_text(self, task: AnalysisTask) -> str:
         content = " ".join([task.task_name, task.reasoning, task.expected_output])

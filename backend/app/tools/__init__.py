@@ -1,6 +1,7 @@
 """Tool package."""
 
 from app.tools.anomaly_detection_tool import AnomalyDetectionTool
+from app.tools.capabilities import validate_capability
 from app.tools.correlation_analysis_tool import CorrelationAnalysisTool
 from app.tools.data_cleaning_tool import DataCleaningTool
 from app.tools.data_quality_tool import DataQualityTool
@@ -23,4 +24,5 @@ __all__ = [
     "StatsTool",
     "ToolRegistry",
     "TrendTool",
+    "validate_capability",
 ]
