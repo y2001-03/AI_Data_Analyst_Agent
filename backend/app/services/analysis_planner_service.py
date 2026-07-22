@@ -72,7 +72,7 @@ class AnalysisPlannerService:
         """Generate a validated Planner Contract from LLM or fallback output."""
         if not self.settings.dashscope_api_key:
             return self.contract_builder.build_plan(
-                self._mock_tasks(file_info, question),
+                self._build_mock_task_payloads(file_info, question),
                 file_info,
                 question=question,
                 source="fallback",
@@ -95,7 +95,7 @@ class AnalysisPlannerService:
             )
         except Exception as exc:
             return self.contract_builder.build_plan(
-                self._mock_tasks(file_info, question),
+                self._build_mock_task_payloads(file_info, question),
                 file_info,
                 question=question,
                 source="fallback",
@@ -339,8 +339,19 @@ class AnalysisPlannerService:
         self,
         file_info: DatasetUploadResponse,
         question: str | None = None,
-    ) -> list[object]:
+    ) -> list[AnalysisTask]:
         """Return deterministic mock tasks when no API key is configured."""
+        return [
+            self._mock_payload_to_analysis_task(payload)
+            for payload in self._build_mock_task_payloads(file_info, question)
+        ]
+
+    def _build_mock_task_payloads(
+        self,
+        file_info: DatasetUploadResponse,
+        question: str | None = None,
+    ) -> list[object]:
+        """Return deterministic fallback payloads for Planner Contract validation."""
         primary_column = file_info.columns[0].name if file_info.columns else "primary field"
         lowered_question = (question or "").lower()
         if question:
@@ -421,7 +432,7 @@ class AnalysisPlannerService:
                         params={},
                     ),
                 ]
-            if self._has_anomaly_intent(lowered_question, anomaly_tokens):
+            if self._has_fallback_anomaly_intent(lowered_question, anomaly_tokens):
                 params = self._fallback_anomaly_params(file_info, lowered_question)
                 return [
                     AnalysisTask(
@@ -438,7 +449,7 @@ class AnalysisPlannerService:
                         params=params,
                     ),
                 ]
-            if self._has_forecast_intent(lowered_question, forecast_tokens):
+            if self._has_fallback_forecast_intent(lowered_question, forecast_tokens):
                 params = self._fallback_forecast_params(file_info, lowered_question)
                 return [
                     AnalysisTask(
@@ -527,7 +538,7 @@ class AnalysisPlannerService:
                         params={},
                     ),
                 ]
-            if any(token in lowered_question for token in trend_tokens):
+            if self._has_fallback_trend_intent(lowered_question, trend_tokens):
                 return [
                     AnalysisTask(
                         task_name="Question-Focused Trend Analysis",
@@ -587,6 +598,41 @@ class AnalysisPlannerService:
             ),
         ]
 
+    def _has_fallback_anomaly_intent(
+        self,
+        question: str,
+        tokens: tuple[str, ...],
+    ) -> bool:
+        """Recognize anomaly intent before generic cleaning fallback."""
+        if self._has_anomaly_intent(question, tokens):
+            return True
+        return any(
+            token in question
+            for token in ("异常检测", "异常值", "异常点", "异常数据", "异常记录", "删除异常值", "移除异常值", "清除异常值")
+        )
+
+    def _has_fallback_forecast_intent(
+        self,
+        question: str,
+        tokens: tuple[str, ...],
+    ) -> bool:
+        """Recognize explicit forecast intent before plain historical trend routing."""
+        if self._has_forecast_intent(question, tokens):
+            return True
+        if any(token in question for token in ("预测", "forecast", "forecasting", "predict", "下周", "会是多少")):
+            return True
+        if "未来" in question and any(token in question for token in ("sales", "销售", "销售额", "趋势", "走势", "价格", "收入", "利润")):
+            return True
+        return False
+
+    def _has_fallback_trend_intent(
+        self,
+        question: str,
+        tokens: tuple[str, ...],
+    ) -> bool:
+        """Recognize plain historical trend intent."""
+        return any(token in question for token in tokens) or any(token in question for token in ("趋势", "走势", "变化趋势"))
+
     def _fallback_multi_intent_tasks(
         self,
         file_info: DatasetUploadResponse,
@@ -602,7 +648,11 @@ class AnalysisPlannerService:
     ) -> list[dict[str, object]] | None:
         """Build a conservative multi-task fallback plan for clearly combined intents."""
         detected: list[tuple[str, dict[str, object]]] = []
-        if any(token in question for token in cleaning_execute_tokens):
+        anomaly_intent = self._has_fallback_anomaly_intent(question, anomaly_tokens)
+        forecast_intent = self._has_fallback_forecast_intent(question, forecast_tokens)
+        if forecast_intent:
+            detected.append(("forecast_analysis", self._fallback_forecast_params(file_info, question)))
+        if not anomaly_intent and any(token in question for token in cleaning_execute_tokens):
             detected.append(
                 (
                     "data_cleaning_execute",
@@ -616,14 +666,12 @@ class AnalysisPlannerService:
             detected.append(("data_quality_analysis", {}))
         if any(token in question for token in distribution_tokens):
             detected.append(("distribution_analysis", self._fallback_distribution_params(file_info, question)))
-        if self._has_anomaly_intent(question, anomaly_tokens):
+        if anomaly_intent:
             detected.append(("anomaly_detection", self._fallback_anomaly_params(file_info, question)))
         if any(token in question for token in correlation_tokens):
             detected.append(("correlation_analysis", self._fallback_correlation_params(file_info, question)))
-        if any(token in question for token in trend_tokens):
+        if not forecast_intent and self._has_fallback_trend_intent(question, trend_tokens):
             detected.append(("trend", {}))
-        if self._has_forecast_intent(question, forecast_tokens):
-            detected.append(("forecast_analysis", self._fallback_forecast_params(file_info, question)))
 
         unique: list[tuple[str, dict[str, object]]] = []
         seen_types: set[str] = set()
@@ -688,6 +736,28 @@ class AnalysisPlannerService:
             "forecast_analysis": "Fallback Forecast Analysis",
         }
         return names.get(task_type, "Fallback Analysis Task")
+
+    def _mock_payload_to_analysis_task(self, payload: object) -> AnalysisTask:
+        """Adapt fallback payloads back to the legacy AnalysisTask contract."""
+        if isinstance(payload, AnalysisTask):
+            return payload
+        if not isinstance(payload, dict):
+            return AnalysisTask(
+                task_name="Fallback Analysis Task",
+                reasoning="Fallback produced an unsupported payload shape.",
+                expected_output="Summary statistics for the dataset.",
+                type="stats",
+                params={},
+            )
+        task_type = payload.get("task_type") or payload.get("type") or "stats"
+        params = payload.get("params")
+        return AnalysisTask(
+            task_name=str(payload.get("task_name") or payload.get("name") or self._fallback_task_name(str(task_type))),
+            reasoning=str(payload.get("reason") or payload.get("reasoning") or "Fallback identified an analysis task."),
+            expected_output=str(payload.get("expected_output") or payload.get("description") or "Analysis result."),
+            type=str(task_type),
+            params=dict(params) if isinstance(params, dict) else {},
+        )
 
     def _fallback_anomaly_params(
         self,
@@ -898,6 +968,7 @@ class AnalysisPlannerService:
             method = "naive"
         else:
             method = "auto"
+        method = self._fallback_forecast_method(question) or method
         params: dict[str, object] = {
             "mode": "grouped" if grouped else "univariate",
             "method": method,
@@ -927,6 +998,16 @@ class AnalysisPlannerService:
         for value in ("forward_fill", "interpolate", "drop", "error"):
             if value in question and "missing" in question: params["missing_target_strategy"] = value
         return params
+
+    def _fallback_forecast_method(self, question: str) -> str | None:
+        """Recognize explicit baseline forecast method names in fallback routing."""
+        if any(token in question for token in ("moving average", "moving_average", "移动平均")):
+            return "moving_average"
+        if any(token in question for token in ("linear trend", "linear_trend", "线性趋势", "线性")):
+            return "linear_trend"
+        if any(token in question for token in ("seasonal naive", "seasonal_naive", "季节性 naive", "季节性naive", "季节性")):
+            return "seasonal_naive"
+        return None
 
     def _forecast_horizon(self, question: str) -> int:
         explicit = re.search(r"(?:horizon|未来|future)\s*(?:=|:|为)?\s*(\d+)\s*(?:天|day|days|期|步)?", question)

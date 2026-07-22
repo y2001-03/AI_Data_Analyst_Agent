@@ -1095,32 +1095,117 @@ def test_fallback_stats_groupby_and_trend_visualization_behavior_is_preserved() 
     assert group_result.chart is not None
 
 
+def test_mock_tasks_keep_legacy_analysis_task_contract_for_core_fallbacks() -> None:
+    planner = object.__new__(AnalysisPlannerService)
+    planner.registry = ToolRegistry.with_default_tools()
+    planner.contract_builder = _builder()
+    cases = [
+        ("find sales outliers", "anomaly_detection"),
+        ("data quality overview", "data_quality_analysis"),
+        ("fill sales missing values with median", "data_cleaning_execute"),
+        ("forecast future sales", "forecast_analysis"),
+        ("analyze distribution and find outliers", "distribution_analysis"),
+    ]
+    for question, expected_type in cases:
+        task = planner._mock_tasks(_file_info(), question)[0]
+        assert isinstance(task, AnalysisTask)
+        assert task.type == expected_type
+        assert isinstance(task.params, dict)
+        assert "depends_on" not in task.params
+        assert "input_bindings" not in task.params
+
+
+def test_fallback_payloads_still_enter_contract_and_strip_detection_only() -> None:
+    service = object.__new__(AnalysisPlannerService)
+    service.registry = ToolRegistry.with_default_tools()
+    service.contract_builder = _builder()
+    raw_tasks = service._build_mock_task_payloads(_file_info(), "find sales outliers")
+    plan = service.contract_builder.build_plan(
+        raw_tasks,
+        _file_info(),
+        source="fallback",
+        fallback_used=True,
+    )
+    adapted = service.contract_builder.to_analysis_tasks(plan)
+    assert plan.status == "valid"
+    assert plan.tasks[0].task_type == "anomaly_detection"
+    assert "detection_only" not in plan.tasks[0].params
+    assert "detection_only" not in adapted[0].params
+
+
+def test_delete_anomaly_fallback_keeps_detection_only_anomaly_priority() -> None:
+    service = object.__new__(AnalysisPlannerService)
+    service.registry = ToolRegistry.with_default_tools()
+    service.contract_builder = _builder()
+    task = service._mock_tasks(_file_info(), "删除 sales 异常值")[0]
+    raw_task = service._build_mock_task_payloads(_file_info(), "删除 sales 异常值")[0]
+    plan = service.contract_builder.build_plan(
+        service._build_mock_task_payloads(_file_info(), "删除 sales 异常值"),
+        _file_info(),
+        source="fallback",
+        fallback_used=True,
+    )
+    adapted = service.contract_builder.to_analysis_tasks(plan)
+    assert task.type == "anomaly_detection"
+    assert task.params["detection_only"] is True
+    assert isinstance(raw_task, AnalysisTask)
+    assert raw_task.params["detection_only"] is True
+    assert "detection_only" not in plan.tasks[0].params
+    assert "detection_only" not in adapted[0].params
+
+
+def test_single_forecast_fallback_preserves_explicit_method_params() -> None:
+    service = object.__new__(AnalysisPlannerService)
+    service.registry = ToolRegistry.with_default_tools()
+    service.contract_builder = _builder()
+    linear = service._mock_tasks(_file_info(), "使用线性趋势预测未来 sales")[0]
+    moving = service._mock_tasks(_file_info(), "使用移动平均预测未来 sales")[0]
+    seasonal = service._mock_tasks(_file_info(), "使用季节性 naive 预测未来 sales")[0]
+    assert linear.type == "forecast_analysis"
+    assert linear.params["method"] == "linear_trend"
+    assert moving.params["method"] == "moving_average"
+    assert seasonal.params["method"] == "seasonal_naive"
+
+
+def test_forecast_intent_takes_priority_over_plain_trend_fallback() -> None:
+    service = object.__new__(AnalysisPlannerService)
+    service.registry = ToolRegistry.with_default_tools()
+    service.contract_builder = _builder()
+    linear = service._mock_tasks(_file_info(), "使用线性趋势预测未来 sales")[0]
+    future_trend = service._mock_tasks(_file_info(), "查看未来销售趋势")[0]
+    plain_trend = service._mock_tasks(_file_info(), "分析 sales 趋势")[0]
+    assert linear.type == "forecast_analysis"
+    assert linear.params["method"] == "linear_trend"
+    assert future_trend.type == "forecast_analysis"
+    assert plain_trend.type == "trend"
+
+
 def test_fallback_multi_intent_tasks_are_contract_validated() -> None:
     service = object.__new__(AnalysisPlannerService)
     service.registry = ToolRegistry.with_default_tools()
     service.contract_builder = _builder()
 
     distribution_anomaly = service.contract_builder.build_plan(
-        service._mock_tasks(_file_info(), "analyze distribution and find outliers"),
+        service._build_mock_task_payloads(_file_info(), "analyze distribution and find outliers"),
         _file_info(),
         source="fallback",
         fallback_used=True,
     )
     quality_correlation = service.contract_builder.build_plan(
-        service._mock_tasks(_file_info(), "check data quality and correlation"),
+        service._build_mock_task_payloads(_file_info(), "check data quality and correlation"),
         _file_info(),
         source="fallback",
         fallback_used=True,
     )
     trend_forecast = service.contract_builder.build_plan(
-        service._mock_tasks(_file_info(), "show daily trend and forecast future sales"),
+        service._build_mock_task_payloads(_file_info(), "show daily trend and forecast future sales"),
         _file_info(),
         source="fallback",
         fallback_used=True,
     )
     assert [task.task_type for task in distribution_anomaly.tasks] == ["distribution_analysis", "anomaly_detection"]
     assert [task.task_type for task in quality_correlation.tasks] == ["data_quality_analysis", "correlation_analysis"]
-    assert [task.task_type for task in trend_forecast.tasks] == ["trend", "forecast_analysis"]
+    assert [task.task_type for task in trend_forecast.tasks] == ["forecast_analysis"]
     assert distribution_anomaly.execution_stages[0].task_ids == ("task_1", "task_2")
     assert all(task.source == "fallback" for task in distribution_anomaly.tasks)
 
@@ -1129,7 +1214,7 @@ def test_fallback_clean_then_analyze_expresses_dependency_but_is_not_executable(
     service = object.__new__(AnalysisPlannerService)
     service.registry = ToolRegistry.with_default_tools()
     service.contract_builder = _builder()
-    raw_tasks = service._mock_tasks(
+    raw_tasks = service._build_mock_task_payloads(
         _file_info(),
         "fill sales missing values with median then analyze sales distribution",
     )

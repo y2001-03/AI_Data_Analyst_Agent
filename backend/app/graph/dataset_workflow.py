@@ -157,7 +157,7 @@ class DatasetGraphNodes:
             if not state["fallback_reason"]:
                 state["fallback_reason"] = exc.message
             planner_plan = self.analysis_planner_service.contract_builder.build_plan(
-                self.analysis_planner_service._mock_tasks(state["file_info"], state.get("question")),
+                self.analysis_planner_service._build_mock_task_payloads(state["file_info"], state.get("question")),
                 state["file_info"],
                 question=state.get("question"),
                 source="fallback",
@@ -195,7 +195,7 @@ class DatasetGraphNodes:
             if not state["fallback_reason"]:
                 state["fallback_reason"] = str(exc)
             planner_plan = self.analysis_planner_service.contract_builder.build_plan(
-                self.analysis_planner_service._mock_tasks(state["file_info"], state.get("question")),
+                self.analysis_planner_service._build_mock_task_payloads(state["file_info"], state.get("question")),
                 state["file_info"],
                 question=state.get("question"),
                 source="fallback",
