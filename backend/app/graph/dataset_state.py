@@ -18,6 +18,10 @@ class DatasetGraphState(TypedDict):
     schema: list[dict[str, str | int | bool]]
     ai_analysis: AIAnalysisResult | None
     tasks: list[AnalysisTask]
+    planner_plan: dict[str, object] | None
+    planner_status: str | None
+    planner_issues: list[dict[str, object]]
+    normalized_intent: str | None
     execution_results: list[ExecutionResult]
     planner_failed: bool
     execution_failed: bool

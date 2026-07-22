@@ -16,6 +16,9 @@ from app.core.config import get_settings
 from app.core.exceptions import AppException
 from app.core.llm import ChatMessage, get_llm_provider
 from app.schemas.file import AIAnalysisResult, AnalysisTask, DatasetUploadResponse
+from app.schemas.planner_contract import PlannerPlan
+from app.services.planner_contract_builder import PlannerContractBuilder
+from app.tools.registry import ToolRegistry
 
 
 class AnalysisPlannerService:
@@ -32,6 +35,8 @@ class AnalysisPlannerService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self._provider = get_llm_provider()
+        self.registry = ToolRegistry.with_default_tools()
+        self.contract_builder = PlannerContractBuilder(self.registry)
 
     # ------------------------------------------------------------------
     # Public API
@@ -49,8 +54,30 @@ class AnalysisPlannerService:
         Falls back to ``_mock_tasks`` when no API key is configured or
         when the LLM call fails.
         """
+        plan = self.plan(file_info, ai_analysis, question, memory_context)
+        if plan.status != "valid":
+            raise AppException(
+                f"Analysis planner contract validation failed with status '{plan.status}'.",
+                422,
+            )
+        return self.contract_builder.to_analysis_tasks(plan)
+
+    def plan(
+        self,
+        file_info: DatasetUploadResponse,
+        ai_analysis: AIAnalysisResult,
+        question: str | None = None,
+        memory_context: dict[str, object] | None = None,
+    ) -> PlannerPlan:
+        """Generate a validated Planner Contract from LLM or fallback output."""
         if not self.settings.dashscope_api_key:
-            return self._mock_tasks(file_info, question)
+            return self.contract_builder.build_plan(
+                self._mock_tasks(file_info, question),
+                file_info,
+                question=question,
+                source="fallback",
+                fallback_used=True,
+            )
 
         messages = [
             ChatMessage(role="system", content=self._system_prompt()),
@@ -60,9 +87,21 @@ class AnalysisPlannerService:
         ]
         try:
             result = self._provider.structured_output(messages)
-            return self._parse_tasks_from_result(result, file_info)
-        except Exception:
-            return self._mock_tasks(file_info, question)
+            return self.contract_builder.build_plan(
+                result,
+                file_info,
+                question=question,
+                source="llm",
+            )
+        except Exception as exc:
+            return self.contract_builder.build_plan(
+                self._mock_tasks(file_info, question),
+                file_info,
+                question=question,
+                source="fallback",
+                fallback_used=True,
+                parse_failure=type(exc).__name__,
+            )
 
     # ------------------------------------------------------------------
     # Prompt templates (business logic)
@@ -83,6 +122,10 @@ class AnalysisPlannerService:
             "dataset_preview": file_info.preview,
             "dataset_summary": ai_analysis.summary,
             "suggested_analysis": ai_analysis.suggestions,
+            "capability_context": self.contract_builder.build_request_context(
+                file_info,
+                question=question,
+            ).capability_context,
             "dataset_info": {
                 "file_name": file_info.file_name,
                 "file_type": file_info.file_type,
@@ -149,8 +192,13 @@ class AnalysisPlannerService:
             "When SQL is the most natural expression, you may output a task with type sql. "
             "For SQL tasks, use table name dataset and only generate safe SELECT queries. "
             "Output JSON only. "
-            "Return {\"tasks\": [...]} where each task includes: "
-            "task_name, type, reason, params."
+            "Do not output markdown fences, Python code, risk_level, validation_status, or confirmation decisions. "
+            "Use only task_type values and parameter names present in the capability context. "
+            "Use only real dataset field names. "
+            "Return a Planner Contract JSON object: "
+            "{\"user_intent\": \"...\", \"normalized_intent\": \"...\", \"tasks\": [...], \"warnings\": []}. "
+            "Each task should include task_id, task_type, tool_name, name, description, params, reason, and confidence. "
+            "Legacy keys task_name and type are accepted only for backward compatibility."
         )
 
     # ------------------------------------------------------------------
@@ -162,26 +210,14 @@ class AnalysisPlannerService:
         result: dict[str, object],
         file_info: DatasetUploadResponse,
     ) -> list[AnalysisTask]:
-        """Extract and normalise analysis tasks from the structured LLM output.
-
-        The provider has already parsed the JSON; we validate the expected
-        shape and convert each entry to a domain model.
-        """
-        try:
-            tasks = result["tasks"]
-        except KeyError as exc:
+        """Extract and normalise analysis tasks through the Planner Contract."""
+        plan = self.contract_builder.build_plan(result, file_info, source="llm")
+        if plan.status != "valid":
             raise AppException(
-                "Analysis planner returned a response without a 'tasks' key.", 502
-            ) from exc
-        parsed = [
-            self._normalize_task(task, file_info)
-            for task in tasks
-            if isinstance(task, dict)
-        ]
-        parsed = [task for task in parsed if task is not None]
-        if not parsed:
-            raise AppException("Analysis planner returned no usable tasks.", 502)
-        return parsed
+                f"Analysis planner contract validation failed with status '{plan.status}'.",
+                502,
+            )
+        return self.contract_builder.to_analysis_tasks(plan)
 
     def _normalize_task(
         self,
@@ -478,13 +514,6 @@ class AnalysisPlannerService:
                         type="trend",
                         params={},
                     ),
-                    AnalysisTask(
-                        task_name="Question-Focused Chart Task",
-                        reasoning="Provide a chart for the detected trend request.",
-                        expected_output="A chart of the relevant trend output.",
-                        type="chart",
-                        params={},
-                    ),
                 ]
             if any(token in lowered_question for token in group_tokens):
                 return [
@@ -500,13 +529,6 @@ class AnalysisPlannerService:
                         reasoning=f"Answer the user's question: {question}",
                         expected_output="A grouped comparison for the most relevant category and metric.",
                         type="groupby",
-                        params={},
-                    ),
-                    AnalysisTask(
-                        task_name="Question-Focused Chart Task",
-                        reasoning="Provide a chart for the detected comparison request.",
-                        expected_output="A chart of the grouped comparison output.",
-                        type="chart",
                         params={},
                     ),
                 ]
@@ -525,7 +547,7 @@ class AnalysisPlannerService:
                 reasoning="Confirm the dataset is complete and reliable before deeper analysis.",
                 expected_output=f"Data quality report covering missing values and uniqueness for {primary_column}.",
                 type="data_quality_analysis",
-                params={"focus_column": primary_column},
+                params={},
             ),
             AnalysisTask(
                 task_name="Descriptive Statistics",
@@ -538,7 +560,7 @@ class AnalysisPlannerService:
                 task_name="Trend or Segment Analysis",
                 reasoning="Explore whether values vary over time or across categories.",
                 expected_output="A grouped comparison or trend view for the most relevant dimensions.",
-                type="chart",
+                type="trend" if any(self._profile_is_datetime(profile) for profile in file_info.columns) else "groupby",
                 params={},
             ),
         ]

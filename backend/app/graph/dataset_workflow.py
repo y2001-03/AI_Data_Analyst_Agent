@@ -143,27 +143,36 @@ class DatasetGraphNodes:
             "suggestion_count": len(state["ai_analysis"].suggestions),
         }
         try:
-            mock_tasks = self.analysis_planner_service._mock_tasks(
-                state["file_info"],
-                state.get("question"),
-            )
-            tasks = self.analysis_planner_service.plan_tasks(
+            planner_plan = self.analysis_planner_service.plan(
                 state["file_info"],
                 state["ai_analysis"],
                 state.get("question"),
                 state.get("memory_context"),
             )
-            state["planner_failed"] = self._same_tasks(tasks, mock_tasks)
+            self._store_planner_plan(state, planner_plan)
+            state["planner_failed"] = planner_plan.planner_source == "fallback"
         except AppException as exc:
             state["planner_failed"] = True
             state["fallback_used"] = True
             if not state["fallback_reason"]:
                 state["fallback_reason"] = exc.message
-            state["tasks"] = self.analysis_planner_service._mock_tasks(
+            planner_plan = self.analysis_planner_service.contract_builder.build_plan(
+                self.analysis_planner_service._mock_tasks(state["file_info"], state.get("question")),
                 state["file_info"],
-                state.get("question"),
+                question=state.get("question"),
+                source="fallback",
+                fallback_used=True,
+                parse_failure=type(exc).__name__,
             )
-            state["tasks"] = self._ensure_visualization_task(state["file_info"], state["tasks"])
+            self._store_planner_plan(state, planner_plan)
+            state["tasks"] = (
+                self.analysis_planner_service.contract_builder.to_analysis_tasks(planner_plan)
+                if planner_plan.status == "valid"
+                else []
+            )
+            state["tasks"] = self._ensure_visualization_task(state["file_info"], state["tasks"]) if state["tasks"] else []
+            if planner_plan.status != "valid":
+                state["execution_results"] = [self._planning_failure_result(planner_plan)]
             if state["ai_analysis"] is not None:
                 state["ai_analysis"].tasks = state["tasks"]
             self._record_trace(
@@ -185,11 +194,23 @@ class DatasetGraphNodes:
             state["fallback_used"] = True
             if not state["fallback_reason"]:
                 state["fallback_reason"] = str(exc)
-            state["tasks"] = self.analysis_planner_service._mock_tasks(
+            planner_plan = self.analysis_planner_service.contract_builder.build_plan(
+                self.analysis_planner_service._mock_tasks(state["file_info"], state.get("question")),
                 state["file_info"],
-                state.get("question"),
+                question=state.get("question"),
+                source="fallback",
+                fallback_used=True,
+                parse_failure=type(exc).__name__,
             )
-            state["tasks"] = self._ensure_visualization_task(state["file_info"], state["tasks"])
+            self._store_planner_plan(state, planner_plan)
+            state["tasks"] = (
+                self.analysis_planner_service.contract_builder.to_analysis_tasks(planner_plan)
+                if planner_plan.status == "valid"
+                else []
+            )
+            state["tasks"] = self._ensure_visualization_task(state["file_info"], state["tasks"]) if state["tasks"] else []
+            if planner_plan.status != "valid":
+                state["execution_results"] = [self._planning_failure_result(planner_plan)]
             if state["ai_analysis"] is not None:
                 state["ai_analysis"].tasks = state["tasks"]
             self._record_trace(
@@ -206,7 +227,32 @@ class DatasetGraphNodes:
                 len(state["tasks"]),
             )
             return state
-        state["tasks"] = tasks
+        if planner_plan.status != "valid":
+            state["tasks"] = []
+            state["execution_results"] = [self._planning_failure_result(planner_plan)]
+            if state["ai_analysis"] is not None:
+                state["ai_analysis"].tasks = []
+            self._record_trace(
+                state,
+                node="plan",
+                status=planner_plan.status,
+                input_summary=input_summary,
+                output_summary={
+                    "plan_status": planner_plan.status,
+                    "issue_codes": [
+                        issue["code"] for issue in state["planner_issues"]
+                    ],
+                    "task_count": 0,
+                },
+            )
+            logger.warning(
+                "Node completed | node=plan status=%s duration=%.0fms issue_count=%d",
+                planner_plan.status,
+                (time.monotonic() - node_start) * 1000,
+                len(state["planner_issues"]),
+            )
+            return state
+        state["tasks"] = self.analysis_planner_service.contract_builder.to_analysis_tasks(planner_plan)
         state["tasks"] = self._ensure_visualization_task(state["file_info"], state["tasks"])
         if state["ai_analysis"] is not None:
             state["ai_analysis"].tasks = state["tasks"]
@@ -220,7 +266,12 @@ class DatasetGraphNodes:
             node="plan",
             status=status,
             input_summary=input_summary,
-            output_summary={"task_count": len(state["tasks"])},
+            output_summary={
+                "task_count": len(state["tasks"]),
+                "plan_status": planner_plan.status,
+                "normalized_intent": planner_plan.normalized_intent,
+                "issue_codes": [issue["code"] for issue in state["planner_issues"]],
+            },
         )
         logger.info(
             "Node completed | node=plan status=%s duration=%.0fms task_count=%d",
@@ -327,6 +378,16 @@ class DatasetGraphNodes:
         right = [task.model_dump() for task in second]
         return left == right
 
+    def _store_planner_plan(self, state: DatasetGraphState, planner_plan) -> None:
+        """Store JSON-safe planner contract details in graph state."""
+        state["planner_plan"] = planner_plan.model_dump(mode="json")
+        state["planner_status"] = planner_plan.status
+        state["normalized_intent"] = planner_plan.normalized_intent
+        state["planner_issues"] = [
+            issue.model_dump(mode="json")
+            for issue in planner_plan.validation_issues
+        ]
+
     def _skipped_execution_result(self, reason: str) -> ExecutionResult:
         """Return a graph-level skipped execution result."""
         return ExecutionResult(
@@ -341,6 +402,24 @@ class DatasetGraphNodes:
                 "values": [0],
             },
             chart=ExecutionChart(chart_type="bar", x=["skipped"], y=[0]),
+        )
+
+    def _planning_failure_result(self, planner_plan) -> ExecutionResult:
+        """Return a structured planning failure result without executing tools."""
+        issues = [
+            issue.model_dump(mode="json")
+            for issue in planner_plan.validation_issues
+        ]
+        return ExecutionResult(
+            task_name="planning",
+            type="planning_failure",
+            data={
+                "status": planner_plan.status,
+                "normalized_intent": planner_plan.normalized_intent,
+                "issues": issues,
+                "diagnostics": planner_plan.diagnostics.model_dump(mode="json"),
+            },
+            chart=None,
         )
 
     def _ensure_visualization_task(

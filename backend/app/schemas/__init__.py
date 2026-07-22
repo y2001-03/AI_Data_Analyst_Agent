@@ -1,5 +1,21 @@
 """Schema package."""
 
+from app.schemas.planner_contract import (
+    PlannerDiagnostics,
+    PlannerPlan,
+    PlannerRequestContext,
+    PlannerTask,
+    PlannerValidationIssue,
+)
 from app.schemas.tool_capability import ToolCapability, ToolFieldRequirement, ToolParameterSpec
 
-__all__ = ["ToolCapability", "ToolFieldRequirement", "ToolParameterSpec"]
+__all__ = [
+    "PlannerDiagnostics",
+    "PlannerPlan",
+    "PlannerRequestContext",
+    "PlannerTask",
+    "PlannerValidationIssue",
+    "ToolCapability",
+    "ToolFieldRequirement",
+    "ToolParameterSpec",
+]
