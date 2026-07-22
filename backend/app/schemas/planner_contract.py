@@ -14,6 +14,7 @@ PlannerSource = Literal["llm", "fallback", "repaired"]
 PlannerValidationStatus = Literal["pending", "valid", "invalid"]
 PlannerPlanStatus = Literal["valid", "invalid", "clarification_required", "unsupported"]
 PlannerIssueSeverity = Literal["error", "warning", "info"]
+PlannerInputSourceType = Literal["original_dataset", "task_output", "planner_context", "literal"]
 
 PlannerIssueCode = Literal[
     "UNKNOWN_TASK_TYPE",
@@ -32,7 +33,79 @@ PlannerIssueCode = Literal[
     "NON_JSON_SAFE_PARAMS",
     "UNSUPPORTED_REQUEST",
     "CLARIFICATION_REQUIRED",
+    "UNKNOWN_DEPENDENCY_TASK",
+    "SELF_TASK_DEPENDENCY",
+    "DUPLICATE_TASK_DEPENDENCY",
+    "CYCLIC_TASK_DEPENDENCY",
+    "INVALID_INPUT_BINDING",
+    "UNKNOWN_INPUT_SOURCE_TASK",
+    "INPUT_SOURCE_NOT_DEPENDENCY",
+    "DUPLICATE_INPUT_BINDING",
+    "UNSUPPORTED_TASK_OUTPUT_BINDING",
+    "CONDITIONAL_EXECUTION_UNSUPPORTED",
+    "EXECUTION_PLAN_INCOMPLETE",
 ]
+
+
+class PlannerInputBinding(BaseModel):
+    """Declarative task input source binding; it is not executed in this step."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    input_name: str = Field(min_length=1)
+    source_type: PlannerInputSourceType = "original_dataset"
+    source_task_id: str | None = None
+    source_path: str | None = None
+    literal_value: Any = None
+    required: bool = True
+    description: str = ""
+
+    @model_validator(mode="after")
+    def validate_binding_shape(self) -> Self:
+        if self.source_type == "original_dataset":
+            if self.source_task_id is not None:
+                raise ValueError("original_dataset binding must not define source_task_id")
+            if self.source_path not in {None, "$", "dataset"}:
+                raise ValueError("original_dataset binding source_path must be empty or a stable dataset alias")
+        elif self.source_type == "task_output":
+            if not self.source_task_id:
+                raise ValueError("task_output binding requires source_task_id")
+            if not self.source_path:
+                raise ValueError("task_output binding requires source_path")
+        elif self.source_type == "planner_context":
+            if not self.source_path:
+                raise ValueError("planner_context binding requires source_path")
+            if self.source_task_id is not None:
+                raise ValueError("planner_context binding must not define source_task_id")
+        elif self.source_type == "literal":
+            if self.source_task_id is not None:
+                raise ValueError("literal binding must not define source_task_id")
+            _ensure_json_value(self.literal_value, f"input binding '{self.input_name}' literal_value")
+        json.dumps(self.model_dump(), allow_nan=False)
+        return self
+
+
+class PlannerExecutionStage(BaseModel):
+    """Stable execution stage derived from the task dependency DAG."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage_id: str = Field(min_length=1)
+    order: int = Field(ge=1)
+    task_ids: tuple[str, ...]
+    parallelizable: bool
+    risk_level: RiskLevel
+    requires_confirmation: bool = False
+    description: str = ""
+
+    @model_validator(mode="after")
+    def validate_stage(self) -> Self:
+        if not self.task_ids:
+            raise ValueError("execution stage must contain at least one task")
+        if len(set(self.task_ids)) != len(self.task_ids):
+            raise ValueError("execution stage task_ids must be unique")
+        json.dumps(self.model_dump(), allow_nan=False)
+        return self
 
 
 class PlannerValidationIssue(BaseModel):
@@ -69,10 +142,16 @@ class PlannerDiagnostics(BaseModel):
     invalid_task_count: int = 0
     capability_catalog_version: str = "1.0"
     fallback_used: bool = False
-    normalization_warnings: tuple[str, ...] = ()
+    normalization_warnings: list[str] = Field(default_factory=list)
     parse_failure: str | None = None
     tool_selection_rule: str | None = None
-    missing_information: tuple[str, ...] = ()
+    missing_information: list[str] = Field(default_factory=list)
+    dependency_count: int = 0
+    stage_count: int = 0
+    maximum_parallel_width: int = 0
+    topological_sort_applied: bool = False
+    execution_supported: bool = True
+    unsupported_binding_count: int = 0
 
 
 class PlannerRequestColumn(BaseModel):
@@ -117,6 +196,10 @@ class PlannerTask(BaseModel):
     requires_confirmation: bool
     validation_status: PlannerValidationStatus = "pending"
     validation_issues: tuple[PlannerValidationIssue, ...] = ()
+    depends_on: tuple[str, ...] = ()
+    input_bindings: tuple[PlannerInputBinding, ...] = ()
+    execution_group: int | None = None
+    execution_order: int | None = None
 
     @model_validator(mode="after")
     def validate_json_payload(self) -> Self:
@@ -137,10 +220,15 @@ class PlannerPlan(BaseModel):
     status: PlannerPlanStatus
     planner_source: PlannerSource
     capability_catalog_version: str = "1.0"
-    warnings: tuple[str, ...] = ()
+    warnings: list[str] = Field(default_factory=list)
     validation_issues: tuple[PlannerValidationIssue, ...] = ()
     diagnostics: PlannerDiagnostics
     metadata: dict[str, Any] = Field(default_factory=dict)
+    execution_stages: tuple[PlannerExecutionStage, ...] = ()
+    execution_order: tuple[str, ...] = ()
+    has_dependencies: bool = False
+    parallelizable: bool = False
+    execution_supported: bool = True
 
     @model_validator(mode="after")
     def validate_plan(self) -> Self:
@@ -157,6 +245,14 @@ class PlannerPlan(BaseModel):
                     raise ValueError("valid plan cannot contain error issues")
         if not self.tasks and self.status not in {"unsupported", "clarification_required", "invalid"}:
             raise ValueError("empty task list requires unsupported, clarification_required, or invalid status")
+        if len(set(self.execution_order)) != len(self.execution_order):
+            raise ValueError("execution_order task ids must be unique")
+        if self.status == "valid" and self.execution_supported and (self.execution_order or self.execution_stages):
+            if set(self.execution_order) != set(ids):
+                raise ValueError("valid executable plan requires execution_order to include every task exactly once")
+            staged_ids = [task_id for stage in self.execution_stages for task_id in stage.task_ids]
+            if set(staged_ids) != set(ids) or len(staged_ids) != len(ids):
+                raise ValueError("valid executable plan requires every task in exactly one execution stage")
         _ensure_json_value(self.metadata, "plan.metadata")
         json.dumps(self.model_dump(), allow_nan=False)
         return self

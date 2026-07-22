@@ -143,8 +143,16 @@ class AnalysisPlannerService:
             "Generate a minimal but complete set of analytical tasks. "
             "Rules: "
             "Prefer 1~3 tasks only. "
-            "Must include chart task if trend or comparison exists. "
             "Must use dataset columns only. "
+            "You may output multiple tasks when the user clearly asks for multiple capabilities. "
+            "Use depends_on only for real ordering, safety, or data dependencies; do not create data dependencies "
+            "only because the user says 'first' and 'then' when tasks can independently read the original dataset. "
+            "When a later task must consume an earlier task result, add an input_bindings item with source_type "
+            "task_output, source_task_id, and source_path; this is declarative and may be rejected by the system "
+            "if runtime transfer is unsupported. "
+            "Use original_dataset bindings for ordinary independent analysis tasks. "
+            "Do not output execution_order, execution_group, risk_level, validation_status, or confirmation decisions. "
+            "Conditional execution such as 'if quality is good then forecast' is not supported in this step. "
             "Available deterministic tools: "
             "forecast_analysis performs ordered train/validation backtesting and heuristic future forecasts for "
             "one numeric time series or independent groups. Choose it only for explicit future prediction, "
@@ -192,12 +200,13 @@ class AnalysisPlannerService:
             "When SQL is the most natural expression, you may output a task with type sql. "
             "For SQL tasks, use table name dataset and only generate safe SELECT queries. "
             "Output JSON only. "
-            "Do not output markdown fences, Python code, risk_level, validation_status, or confirmation decisions. "
+            "Do not output markdown fences, Python code, or system-managed fields. "
             "Use only task_type values and parameter names present in the capability context. "
             "Use only real dataset field names. "
             "Return a Planner Contract JSON object: "
             "{\"user_intent\": \"...\", \"normalized_intent\": \"...\", \"tasks\": [...], \"warnings\": []}. "
-            "Each task should include task_id, task_type, tool_name, name, description, params, reason, and confidence. "
+            "Each task should include task_id, task_type, tool_name, name, description, params, reason, confidence, "
+            "depends_on, and input_bindings. "
             "Legacy keys task_name and type are accepted only for backward compatibility."
         )
 
@@ -330,7 +339,7 @@ class AnalysisPlannerService:
         self,
         file_info: DatasetUploadResponse,
         question: str | None = None,
-    ) -> list[AnalysisTask]:
+    ) -> list[object]:
         """Return deterministic mock tasks when no API key is configured."""
         primary_column = file_info.columns[0].name if file_info.columns else "primary field"
         lowered_question = (question or "").lower()
@@ -386,6 +395,19 @@ class AnalysisPlannerService:
                 "by", "segment", "category", "product", "region", "group",
                 "分组", "按", "产品", "类别", "地区", "对比", "统计",
             )
+            multi_intent_tasks = self._fallback_multi_intent_tasks(
+                file_info,
+                lowered_question,
+                quality_tokens=quality_priority_tokens,
+                anomaly_tokens=anomaly_tokens,
+                forecast_tokens=forecast_tokens,
+                correlation_tokens=correlation_tokens,
+                distribution_tokens=distribution_tokens,
+                trend_tokens=trend_tokens,
+                cleaning_execute_tokens=cleaning_execute_tokens,
+            )
+            if multi_intent_tasks is not None:
+                return multi_intent_tasks
             if any(token in lowered_question for token in quality_priority_tokens):
                 return [
                     AnalysisTask(
@@ -564,6 +586,108 @@ class AnalysisPlannerService:
                 params={},
             ),
         ]
+
+    def _fallback_multi_intent_tasks(
+        self,
+        file_info: DatasetUploadResponse,
+        question: str,
+        *,
+        quality_tokens: tuple[str, ...],
+        anomaly_tokens: tuple[str, ...],
+        forecast_tokens: tuple[str, ...],
+        correlation_tokens: tuple[str, ...],
+        distribution_tokens: tuple[str, ...],
+        trend_tokens: tuple[str, ...],
+        cleaning_execute_tokens: tuple[str, ...],
+    ) -> list[dict[str, object]] | None:
+        """Build a conservative multi-task fallback plan for clearly combined intents."""
+        detected: list[tuple[str, dict[str, object]]] = []
+        if any(token in question for token in cleaning_execute_tokens):
+            detected.append(
+                (
+                    "data_cleaning_execute",
+                    {
+                        "mode": "execute",
+                        "actions": self._fallback_cleaning_actions(file_info, question),
+                    },
+                )
+            )
+        if any(token in question for token in quality_tokens):
+            detected.append(("data_quality_analysis", {}))
+        if any(token in question for token in distribution_tokens):
+            detected.append(("distribution_analysis", self._fallback_distribution_params(file_info, question)))
+        if self._has_anomaly_intent(question, anomaly_tokens):
+            detected.append(("anomaly_detection", self._fallback_anomaly_params(file_info, question)))
+        if any(token in question for token in correlation_tokens):
+            detected.append(("correlation_analysis", self._fallback_correlation_params(file_info, question)))
+        if any(token in question for token in trend_tokens):
+            detected.append(("trend", {}))
+        if self._has_forecast_intent(question, forecast_tokens):
+            detected.append(("forecast_analysis", self._fallback_forecast_params(file_info, question)))
+
+        unique: list[tuple[str, dict[str, object]]] = []
+        seen_types: set[str] = set()
+        for task_type, params in detected:
+            if task_type not in seen_types:
+                unique.append((task_type, params))
+                seen_types.add(task_type)
+        if len(unique) < 2:
+            return None
+
+        cleaning_task_id = "task_1" if unique[0][0] == "data_cleaning_execute" else None
+        tasks: list[dict[str, object]] = []
+        for index, (task_type, params) in enumerate(unique, start=1):
+            task_id = f"task_{index}"
+            depends_on: list[str] = []
+            input_bindings: list[dict[str, object]] = [
+                {
+                    "input_name": "dataset",
+                    "source_type": "original_dataset",
+                    "required": True,
+                    "description": "Uses the uploaded dataset.",
+                }
+            ]
+            if cleaning_task_id and task_id != cleaning_task_id:
+                depends_on = [cleaning_task_id]
+                input_bindings = [
+                    {
+                        "input_name": "dataset",
+                        "source_type": "task_output",
+                        "source_task_id": cleaning_task_id,
+                        "source_path": "data.cleaned_preview",
+                        "required": True,
+                        "description": (
+                            "Declarative dependency on cleaning output; current execution does not "
+                            "treat bounded previews as full datasets."
+                        ),
+                    }
+                ]
+            tasks.append(
+                {
+                    "task_id": task_id,
+                    "task_type": task_type,
+                    "name": self._fallback_task_name(task_type),
+                    "description": self._build_expected_output(task_type, params, file_info),
+                    "params": params,
+                    "reason": "Fallback identified a clear multi-capability user request.",
+                    "confidence": 0.85,
+                    "depends_on": depends_on,
+                    "input_bindings": input_bindings,
+                }
+            )
+        return tasks
+
+    def _fallback_task_name(self, task_type: str) -> str:
+        names = {
+            "data_cleaning_execute": "Fallback Data Cleaning Execution",
+            "data_quality_analysis": "Fallback Data Quality Analysis",
+            "distribution_analysis": "Fallback Distribution Analysis",
+            "anomaly_detection": "Fallback Anomaly Detection",
+            "correlation_analysis": "Fallback Correlation Analysis",
+            "trend": "Fallback Trend Analysis",
+            "forecast_analysis": "Fallback Forecast Analysis",
+        }
+        return names.get(task_type, "Fallback Analysis Task")
 
     def _fallback_anomaly_params(
         self,

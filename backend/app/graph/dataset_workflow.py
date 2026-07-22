@@ -167,11 +167,11 @@ class DatasetGraphNodes:
             self._store_planner_plan(state, planner_plan)
             state["tasks"] = (
                 self.analysis_planner_service.contract_builder.to_analysis_tasks(planner_plan)
-                if planner_plan.status == "valid"
+                if planner_plan.status == "valid" and planner_plan.execution_supported
                 else []
             )
             state["tasks"] = self._ensure_visualization_task(state["file_info"], state["tasks"]) if state["tasks"] else []
-            if planner_plan.status != "valid":
+            if planner_plan.status != "valid" or not planner_plan.execution_supported:
                 state["execution_results"] = [self._planning_failure_result(planner_plan)]
             if state["ai_analysis"] is not None:
                 state["ai_analysis"].tasks = state["tasks"]
@@ -205,11 +205,11 @@ class DatasetGraphNodes:
             self._store_planner_plan(state, planner_plan)
             state["tasks"] = (
                 self.analysis_planner_service.contract_builder.to_analysis_tasks(planner_plan)
-                if planner_plan.status == "valid"
+                if planner_plan.status == "valid" and planner_plan.execution_supported
                 else []
             )
             state["tasks"] = self._ensure_visualization_task(state["file_info"], state["tasks"]) if state["tasks"] else []
-            if planner_plan.status != "valid":
+            if planner_plan.status != "valid" or not planner_plan.execution_supported:
                 state["execution_results"] = [self._planning_failure_result(planner_plan)]
             if state["ai_analysis"] is not None:
                 state["ai_analysis"].tasks = state["tasks"]
@@ -227,7 +227,7 @@ class DatasetGraphNodes:
                 len(state["tasks"]),
             )
             return state
-        if planner_plan.status != "valid":
+        if planner_plan.status != "valid" or not planner_plan.execution_supported:
             state["tasks"] = []
             state["execution_results"] = [self._planning_failure_result(planner_plan)]
             if state["ai_analysis"] is not None:
@@ -243,6 +243,10 @@ class DatasetGraphNodes:
                         issue["code"] for issue in state["planner_issues"]
                     ],
                     "task_count": 0,
+                    "execution_supported": planner_plan.execution_supported,
+                    "dependency_count": planner_plan.diagnostics.dependency_count,
+                    "stage_count": planner_plan.diagnostics.stage_count,
+                    "execution_order": list(planner_plan.execution_order),
                 },
             )
             logger.warning(
@@ -271,6 +275,10 @@ class DatasetGraphNodes:
                 "plan_status": planner_plan.status,
                 "normalized_intent": planner_plan.normalized_intent,
                 "issue_codes": [issue["code"] for issue in state["planner_issues"]],
+                "execution_supported": planner_plan.execution_supported,
+                "dependency_count": planner_plan.diagnostics.dependency_count,
+                "stage_count": planner_plan.diagnostics.stage_count,
+                "execution_order": list(planner_plan.execution_order),
             },
         )
         logger.info(
@@ -387,6 +395,13 @@ class DatasetGraphNodes:
             issue.model_dump(mode="json")
             for issue in planner_plan.validation_issues
         ]
+        state["execution_stages"] = [
+            stage.model_dump(mode="json")
+            for stage in planner_plan.execution_stages
+        ]
+        state["execution_order"] = list(planner_plan.execution_order)
+        state["dependency_count"] = planner_plan.diagnostics.dependency_count
+        state["execution_supported"] = planner_plan.execution_supported
 
     def _skipped_execution_result(self, reason: str) -> ExecutionResult:
         """Return a graph-level skipped execution result."""
@@ -418,6 +433,9 @@ class DatasetGraphNodes:
                 "normalized_intent": planner_plan.normalized_intent,
                 "issues": issues,
                 "diagnostics": planner_plan.diagnostics.model_dump(mode="json"),
+                "execution_stages": [stage.model_dump(mode="json") for stage in planner_plan.execution_stages],
+                "execution_order": list(planner_plan.execution_order),
+                "execution_supported": planner_plan.execution_supported,
             },
             chart=None,
         )

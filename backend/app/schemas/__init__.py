@@ -2,6 +2,8 @@
 
 from app.schemas.planner_contract import (
     PlannerDiagnostics,
+    PlannerExecutionStage,
+    PlannerInputBinding,
     PlannerPlan,
     PlannerRequestContext,
     PlannerTask,
@@ -11,6 +13,8 @@ from app.schemas.tool_capability import ToolCapability, ToolFieldRequirement, To
 
 __all__ = [
     "PlannerDiagnostics",
+    "PlannerExecutionStage",
+    "PlannerInputBinding",
     "PlannerPlan",
     "PlannerRequestContext",
     "PlannerTask",

@@ -22,6 +22,10 @@ class DatasetGraphState(TypedDict):
     planner_status: str | None
     planner_issues: list[dict[str, object]]
     normalized_intent: str | None
+    execution_stages: list[dict[str, object]]
+    execution_order: list[str]
+    dependency_count: int
+    execution_supported: bool
     execution_results: list[ExecutionResult]
     planner_failed: bool
     execution_failed: bool

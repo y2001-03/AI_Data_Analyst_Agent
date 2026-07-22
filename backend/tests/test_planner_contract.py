@@ -19,6 +19,8 @@ from app.schemas.file import (
 )
 from app.schemas.planner_contract import (
     PlannerDiagnostics,
+    PlannerExecutionStage,
+    PlannerInputBinding,
     PlannerPlan,
     PlannerTask,
     PlannerValidationIssue,
@@ -112,6 +114,48 @@ def test_planner_task_and_plan_are_json_safe() -> None:
     payload = plan.model_dump()
     assert payload["tasks"][0]["task_type"] == "forecast_analysis"
     json.dumps(payload, allow_nan=False)
+
+
+def test_planner_input_binding_and_execution_stage_are_json_safe() -> None:
+    binding = PlannerInputBinding(
+        input_name="dataset",
+        source_type="original_dataset",
+        required=True,
+        description="Uses the uploaded dataset.",
+    )
+    task_output = PlannerInputBinding(
+        input_name="dataset",
+        source_type="task_output",
+        source_task_id="task_1",
+        source_path="data.cleaned_preview",
+    )
+    stage = PlannerExecutionStage(
+        stage_id="stage_1",
+        order=1,
+        task_ids=("task_1", "task_2"),
+        parallelizable=True,
+        risk_level="read_only",
+        requires_confirmation=False,
+        description="Independent tasks.",
+    )
+    assert binding.source_task_id is None
+    assert task_output.source_task_id == "task_1"
+    json.dumps(binding.model_dump(), allow_nan=False)
+    json.dumps(task_output.model_dump(), allow_nan=False)
+    json.dumps(stage.model_dump(), allow_nan=False)
+
+
+def test_planner_dependency_schema_defaults_and_invalid_values() -> None:
+    task = _valid_task()
+    assert task.depends_on == ()
+    assert task.input_bindings == ()
+
+    with pytest.raises(ValidationError):
+        PlannerInputBinding(input_name="dataset", source_type="unknown")
+    with pytest.raises(ValidationError):
+        PlannerInputBinding(input_name="dataset", source_type="task_output", source_path="data.x")
+    with pytest.raises(ValidationError):
+        PlannerInputBinding(input_name="literal", source_type="literal", literal_value={"bad": object()})
 
 
 @pytest.mark.parametrize(
@@ -479,6 +523,252 @@ def test_plan_status_rules_valid_invalid_clarification_unsupported_and_warning()
     assert warning.warnings
 
 
+def test_valid_dag_generates_stable_execution_order_and_stages() -> None:
+    plan = _builder().build_plan(
+        {
+            "tasks": [
+                {"task_id": "task_1", "task_type": "data_quality_analysis", "name": "Quality"},
+                {
+                    "task_id": "task_2",
+                    "task_type": "distribution_analysis",
+                    "name": "Distribution",
+                    "params": {"mode": "numeric", "columns": ["sales"]},
+                    "depends_on": ["task_1"],
+                },
+                {
+                    "task_id": "task_3",
+                    "task_type": "correlation_analysis",
+                    "name": "Correlation",
+                    "params": {"columns": ["sales", "price"]},
+                    "depends_on": ["task_1"],
+                },
+            ]
+        },
+        _file_info(),
+    )
+    assert plan.status == "valid"
+    assert plan.execution_supported is True
+    assert plan.execution_order == ("task_1", "task_2", "task_3")
+    assert [stage.task_ids for stage in plan.execution_stages] == [("task_1",), ("task_2", "task_3")]
+    assert plan.execution_stages[1].parallelizable is True
+    assert plan.metadata["dependency_count"] == 2
+    assert plan.metadata["stage_count"] == 2
+    assert plan.diagnostics.topological_sort_applied is True
+
+
+def test_independent_tasks_share_one_parallelizable_stage_and_preserve_order() -> None:
+    plan = _builder().build_plan(
+        {
+            "tasks": [
+                {"task_id": "task_1", "task_type": "data_quality_analysis", "name": "Quality"},
+                {
+                    "task_id": "task_2",
+                    "task_type": "correlation_analysis",
+                    "name": "Correlation",
+                    "params": {"columns": ["sales", "price"]},
+                },
+            ]
+        },
+        _file_info(),
+    )
+    assert plan.status == "valid"
+    assert plan.execution_order == ("task_1", "task_2")
+    assert len(plan.execution_stages) == 1
+    assert plan.execution_stages[0].task_ids == ("task_1", "task_2")
+    assert plan.parallelizable is True
+
+
+@pytest.mark.parametrize(
+    ("raw_tasks", "code"),
+    [
+        (
+            [
+                {"task_id": "task_1", "task_type": "data_quality_analysis", "name": "Quality", "depends_on": ["missing"]},
+            ],
+            "UNKNOWN_DEPENDENCY_TASK",
+        ),
+        (
+            [
+                {"task_id": "task_1", "task_type": "data_quality_analysis", "name": "Quality", "depends_on": ["task_1"]},
+            ],
+            "SELF_TASK_DEPENDENCY",
+        ),
+        (
+            [
+                {
+                    "task_id": "task_1",
+                    "task_type": "data_quality_analysis",
+                    "name": "Quality",
+                    "depends_on": ["task_2", "task_2"],
+                },
+                {"task_id": "task_2", "task_type": "stats", "name": "Stats"},
+            ],
+            "DUPLICATE_TASK_DEPENDENCY",
+        ),
+        (
+            [
+                {"task_id": "task_1", "task_type": "stats", "name": "A", "depends_on": ["task_2"]},
+                {"task_id": "task_2", "task_type": "stats", "name": "B", "depends_on": ["task_1"]},
+            ],
+            "CYCLIC_TASK_DEPENDENCY",
+        ),
+    ],
+)
+def test_invalid_dependency_dags_are_rejected(raw_tasks: list[dict[str, object]], code: str) -> None:
+    plan = _builder().build_plan({"tasks": raw_tasks}, _file_info())
+    assert plan.status == "invalid"
+    assert plan.execution_order == ()
+    assert plan.execution_stages == ()
+    assert any(issue.code == code for issue in plan.validation_issues)
+
+
+def test_input_binding_validation_and_unsupported_task_output_boundary() -> None:
+    supported_shape = _builder().build_plan(
+        {
+            "tasks": [
+                {
+                    "task_id": "task_1",
+                    "task_type": "data_cleaning_execute",
+                    "name": "Clean",
+                    "params": {"mode": "execute", "actions": [{"action_type": "trim_strings"}]},
+                    "input_bindings": [{"input_name": "dataset", "source_type": "original_dataset"}],
+                },
+                {
+                    "task_id": "task_2",
+                    "task_type": "distribution_analysis",
+                    "name": "Distribution",
+                    "params": {"mode": "numeric", "columns": ["sales"]},
+                    "depends_on": ["task_1"],
+                    "input_bindings": [
+                        {
+                            "input_name": "dataset",
+                            "source_type": "task_output",
+                            "source_task_id": "task_1",
+                            "source_path": "data.cleaned_preview",
+                        }
+                    ],
+                },
+            ]
+        },
+        _file_info(),
+    )
+    assert supported_shape.status == "valid"
+    assert supported_shape.execution_supported is False
+    assert any(issue.code == "UNSUPPORTED_TASK_OUTPUT_BINDING" for issue in supported_shape.validation_issues)
+    with pytest.raises(ValueError, match="executable"):
+        _builder().to_analysis_tasks(supported_shape)
+
+    not_dependency = _builder().build_plan(
+        {
+            "tasks": [
+                {"task_id": "task_1", "task_type": "stats", "name": "Stats"},
+                {
+                    "task_id": "task_2",
+                    "task_type": "distribution_analysis",
+                    "name": "Distribution",
+                    "params": {"mode": "numeric", "columns": ["sales"]},
+                    "input_bindings": [
+                        {
+                            "input_name": "dataset",
+                            "source_type": "task_output",
+                            "source_task_id": "task_1",
+                            "source_path": "data.rows",
+                        }
+                    ],
+                },
+            ]
+        },
+        _file_info(),
+    )
+    assert not_dependency.status == "invalid"
+    assert any(issue.code == "INPUT_SOURCE_NOT_DEPENDENCY" for issue in not_dependency.validation_issues)
+
+
+def test_plan_metadata_limitations_are_json_safe_lists_for_task_output_binding() -> None:
+    plan = _builder().build_plan(
+        {
+            "tasks": [
+                {
+                    "task_id": "task_1",
+                    "task_type": "data_cleaning_execute",
+                    "name": "Clean",
+                    "params": {"mode": "execute", "actions": [{"action_type": "trim_strings"}]},
+                },
+                {
+                    "task_id": "task_2",
+                    "task_type": "distribution_analysis",
+                    "name": "Distribution",
+                    "params": {"mode": "numeric", "columns": ["sales"]},
+                    "depends_on": ["task_1"],
+                    "input_bindings": [
+                        {
+                            "input_name": "dataset",
+                            "source_type": "task_output",
+                            "source_task_id": "task_1",
+                            "source_path": "data.cleaned_preview",
+                        }
+                    ],
+                },
+            ]
+        },
+        _file_info(),
+    )
+    assert plan.status == "valid"
+    assert plan.execution_supported is False
+    assert isinstance(plan.metadata["limitations"], list)
+    assert isinstance(plan.diagnostics.normalization_warnings, list)
+    assert isinstance(plan.warnings, list)
+    json.dumps(plan.model_dump(), allow_nan=False)
+
+
+def test_input_binding_duplicate_context_and_invalid_shape_are_detected() -> None:
+    duplicate = _builder().build_plan(
+        {
+            "tasks": [
+                {
+                    "task_id": "task_1",
+                    "task_type": "stats",
+                    "name": "Stats",
+                    "input_bindings": [
+                        {"input_name": "dataset", "source_type": "original_dataset"},
+                        {"input_name": "dataset", "source_type": "original_dataset"},
+                    ],
+                }
+            ]
+        },
+        _file_info(),
+    )
+    bad_context = _builder().build_plan(
+        {
+            "tasks": [
+                {
+                    "task_id": "task_1",
+                    "task_type": "stats",
+                    "name": "Stats",
+                    "input_bindings": [{"input_name": "x", "source_type": "planner_context", "source_path": "full_prompt"}],
+                }
+            ]
+        },
+        _file_info(),
+    )
+    bad_shape = _builder().build_plan(
+        {
+            "tasks": [
+                {
+                    "task_id": "task_1",
+                    "task_type": "stats",
+                    "name": "Stats",
+                    "input_bindings": [{"input_name": "dataset", "source_type": "task_output", "source_path": "data.x"}],
+                }
+            ]
+        },
+        _file_info(),
+    )
+    assert any(issue.code == "DUPLICATE_INPUT_BINDING" for issue in duplicate.validation_issues)
+    assert any(issue.code == "INVALID_INPUT_BINDING" for issue in bad_context.validation_issues)
+    assert any(issue.code == "INVALID_INPUT_BINDING" for issue in bad_shape.validation_issues)
+
+
 def test_llm_output_normalization_generates_task_id_tool_and_ignores_system_fields() -> None:
     plan = _builder().build_plan(
         {
@@ -558,6 +848,28 @@ def test_adapter_preserves_params_type_and_does_not_mutate_task() -> None:
         _builder().planner_task_to_analysis_task(invalid)
 
 
+def test_adapter_uses_topological_order_and_omits_planner_only_fields() -> None:
+    plan = _builder().build_plan(
+        {
+            "tasks": [
+                {
+                    "task_id": "task_2",
+                    "task_type": "distribution_analysis",
+                    "name": "Distribution",
+                    "params": {"mode": "numeric", "columns": ["sales"]},
+                    "depends_on": ["task_1"],
+                },
+                {"task_id": "task_1", "task_type": "data_quality_analysis", "name": "Quality"},
+            ]
+        },
+        _file_info(),
+    )
+    adapted = _builder().to_analysis_tasks(plan)
+    assert [task.type for task in adapted] == ["data_quality_analysis", "distribution_analysis"]
+    assert all("depends_on" not in task.params for task in adapted)
+    assert all("input_bindings" not in task.params for task in adapted)
+
+
 def test_workflow_stores_invalid_plan_and_does_not_enter_execute() -> None:
     invalid_plan = _builder().build_plan(
         {"tasks": [{"task_type": "forecast_analysis", "name": "Forecast", "params": {"time_column": "missing"}}]},
@@ -595,23 +907,15 @@ def test_workflow_stores_invalid_plan_and_does_not_enter_execute() -> None:
 
 
 @pytest.mark.parametrize(
-    "plan",
+    "raw_plan",
     [
-        _builder().build_plan(
-            {"tasks": [{"task_type": "forecast_analysis", "name": "Forecast", "params": {"time_column": "missing"}}]},
-            _file_info(),
-        ),
-        _builder().build_plan(
-            {"tasks": [{"task_type": "distribution_analysis", "name": "Compare", "params": {"mode": "group_comparison", "columns": ["sales"]}}]},
-            _file_info(),
-        ),
-        _builder().build_plan(
-            {"tasks": [{"task_type": "made_up", "name": "Unsupported"}]},
-            _file_info(),
-        ),
+        {"tasks": [{"task_type": "forecast_analysis", "name": "Forecast", "params": {"time_column": "missing"}}]},
+        {"tasks": [{"task_type": "distribution_analysis", "name": "Compare", "params": {"mode": "group_comparison", "columns": ["sales"]}}]},
+        {"tasks": [{"task_type": "made_up", "name": "Unsupported"}]},
     ],
 )
-def test_invalid_clarification_and_unsupported_plans_do_not_enter_execute(plan: PlannerPlan) -> None:
+def test_invalid_clarification_and_unsupported_plans_do_not_enter_execute(raw_plan: dict[str, object]) -> None:
+    plan = _builder().build_plan(raw_plan, _file_info())
     assert plan.status in {"invalid", "clarification_required", "unsupported"}
 
     class Planner:
@@ -640,6 +944,68 @@ def test_invalid_clarification_and_unsupported_plans_do_not_enter_execute(plan: 
     result = nodes.plan(state)
     assert result["tasks"] == []
     assert result["planner_status"] == plan.status
+    assert result["execution_results"][0].type == "planning_failure"
+    assert nodes.route_after_plan(result) == "end"
+
+
+def test_execution_unsupported_plan_does_not_enter_execute() -> None:
+    plan = _builder().build_plan(
+        {
+            "tasks": [
+                {
+                    "task_id": "task_1",
+                    "task_type": "data_cleaning_execute",
+                    "name": "Clean",
+                    "params": {"mode": "execute", "actions": [{"action_type": "trim_strings"}]},
+                },
+                {
+                    "task_id": "task_2",
+                    "task_type": "distribution_analysis",
+                    "name": "Distribution",
+                    "params": {"mode": "numeric", "columns": ["sales"]},
+                    "depends_on": ["task_1"],
+                    "input_bindings": [
+                        {
+                            "input_name": "dataset",
+                            "source_type": "task_output",
+                            "source_task_id": "task_1",
+                            "source_path": "data.cleaned_preview",
+                        }
+                    ],
+                },
+            ]
+        },
+        _file_info(),
+    )
+    assert plan.status == "valid"
+    assert plan.execution_supported is False
+
+    class Planner:
+        contract_builder = _builder()
+
+        def plan(self, file_info, ai_analysis, question=None, memory_context=None):
+            return plan
+
+    nodes = object.__new__(DatasetGraphNodes)
+    nodes.analysis_planner_service = Planner()
+    state = {
+        "file_info": _file_info(),
+        "ai_analysis": AIAnalysisResult(summary="s", suggestions=["x"], tasks=[]),
+        "question": "clean then analyze distribution",
+        "memory_context": None,
+        "error_stage": None,
+        "tasks": [],
+        "execution_results": [],
+        "planner_failed": False,
+        "fallback_used": False,
+        "fallback_reason": None,
+        "trace_log": [],
+        "node_status": {},
+        "execution_path": [],
+    }
+    result = nodes.plan(state)
+    assert result["tasks"] == []
+    assert result["execution_supported"] is False
     assert result["execution_results"][0].type == "planning_failure"
     assert nodes.route_after_plan(result) == "end"
 
@@ -729,6 +1095,80 @@ def test_fallback_stats_groupby_and_trend_visualization_behavior_is_preserved() 
     assert group_result.chart is not None
 
 
+def test_fallback_multi_intent_tasks_are_contract_validated() -> None:
+    service = object.__new__(AnalysisPlannerService)
+    service.registry = ToolRegistry.with_default_tools()
+    service.contract_builder = _builder()
+
+    distribution_anomaly = service.contract_builder.build_plan(
+        service._mock_tasks(_file_info(), "analyze distribution and find outliers"),
+        _file_info(),
+        source="fallback",
+        fallback_used=True,
+    )
+    quality_correlation = service.contract_builder.build_plan(
+        service._mock_tasks(_file_info(), "check data quality and correlation"),
+        _file_info(),
+        source="fallback",
+        fallback_used=True,
+    )
+    trend_forecast = service.contract_builder.build_plan(
+        service._mock_tasks(_file_info(), "show daily trend and forecast future sales"),
+        _file_info(),
+        source="fallback",
+        fallback_used=True,
+    )
+    assert [task.task_type for task in distribution_anomaly.tasks] == ["distribution_analysis", "anomaly_detection"]
+    assert [task.task_type for task in quality_correlation.tasks] == ["data_quality_analysis", "correlation_analysis"]
+    assert [task.task_type for task in trend_forecast.tasks] == ["trend", "forecast_analysis"]
+    assert distribution_anomaly.execution_stages[0].task_ids == ("task_1", "task_2")
+    assert all(task.source == "fallback" for task in distribution_anomaly.tasks)
+
+
+def test_fallback_clean_then_analyze_expresses_dependency_but_is_not_executable() -> None:
+    service = object.__new__(AnalysisPlannerService)
+    service.registry = ToolRegistry.with_default_tools()
+    service.contract_builder = _builder()
+    raw_tasks = service._mock_tasks(
+        _file_info(),
+        "fill sales missing values with median then analyze sales distribution",
+    )
+    plan = service.contract_builder.build_plan(
+        raw_tasks,
+        _file_info(),
+        source="fallback",
+        fallback_used=True,
+    )
+    assert plan.status == "valid"
+    assert plan.has_dependencies is True
+    assert plan.execution_supported is False
+    assert plan.tasks[1].depends_on == ("task_1",)
+    assert plan.tasks[1].input_bindings[0].source_type == "task_output"
+    assert any(issue.code == "UNSUPPORTED_TASK_OUTPUT_BINDING" for issue in plan.validation_issues)
+
+
+def test_conditional_execution_request_is_not_auto_executed() -> None:
+    plan = _builder().build_plan(
+        {
+            "tasks": [
+                {"task_id": "task_1", "task_type": "data_quality_analysis", "name": "Quality"},
+                {
+                    "task_id": "task_2",
+                    "task_type": "forecast_analysis",
+                    "name": "Forecast",
+                    "params": {"time_column": "date", "target_column": "sales"},
+                    "depends_on": ["task_1"],
+                },
+            ]
+        },
+        _file_info(),
+        question="check data quality and if no problem then forecast sales",
+    )
+    assert plan.status == "clarification_required"
+    assert plan.execution_supported is False
+    assert any(issue.code == "CONDITIONAL_EXECUTION_UNSUPPORTED" for issue in plan.validation_issues)
+
+
 def test_dataset_flow_state_and_progress_payload_do_not_expose_prompt_or_capability_catalog() -> None:
     service = object.__new__(DatasetFlowService)
     state = service._build_initial_state(
@@ -742,6 +1182,10 @@ def test_dataset_flow_state_and_progress_payload_do_not_expose_prompt_or_capabil
     assert state["planner_status"] is None
     assert state["planner_issues"] == []
     assert state["normalized_intent"] is None
+    assert state["execution_stages"] == []
+    assert state["execution_order"] == []
+    assert state["dependency_count"] == 0
+    assert state["execution_supported"] is True
 
     payload = service._build_progress_payload(
         "plan",

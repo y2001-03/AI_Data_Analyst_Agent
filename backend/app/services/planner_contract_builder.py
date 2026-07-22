@@ -10,6 +10,8 @@ from typing import Any
 from app.schemas.file import AnalysisTask, DatasetUploadResponse
 from app.schemas.planner_contract import (
     PlannerDiagnostics,
+    PlannerExecutionStage,
+    PlannerInputBinding,
     PlannerIssueCode,
     PlannerPlan,
     PlannerRequestColumn,
@@ -26,6 +28,23 @@ from app.tools.registry import ToolRegistry
 TASK_RISK_OVERRIDES: dict[str, RiskLevel] = {
     "data_cleaning_plan": "preview_only",
     "data_cleaning_execute": "mutating_copy",
+}
+
+RISK_LEVEL_PRIORITY: dict[RiskLevel, int] = {
+    "read_only": 0,
+    "preview_only": 1,
+    "mutating_copy": 2,
+    "external_side_effect": 3,
+}
+
+ALLOWED_PLANNER_CONTEXT_PATHS = {
+    "question",
+    "dataset_id",
+    "file_name",
+    "columns",
+    "row_count",
+    "request_id",
+    "trace_id",
 }
 
 
@@ -95,6 +114,15 @@ class PlannerContractBuilder:
             )
         if parse_failure:
             diagnostics_notes.append("llm_parse_failure")
+        if self._has_unsupported_conditional_request(question):
+            plan_issues.append(
+                self._issue(
+                    "CONDITIONAL_EXECUTION_UNSUPPORTED",
+                    "Conditional execution is not supported in this planning step; the plan will not be executed automatically.",
+                    "error",
+                    repairable=True,
+                )
+            )
         if raw_tasks is None:
             plan_issues.append(
                 self._issue(
@@ -157,8 +185,42 @@ class PlannerContractBuilder:
             )
         normalized_tasks = deduplicated_tasks
 
-        all_issues = [*plan_issues, *(issue for task in normalized_tasks for issue in task.validation_issues)]
+        dependency_issues = self._validate_dependencies(normalized_tasks)
+        binding_issues = self._validate_input_bindings(normalized_tasks)
+        normalized_tasks = self._attach_task_issues(
+            normalized_tasks,
+            [*dependency_issues, *binding_issues],
+        )
+        all_issues = [
+            *plan_issues,
+            *(issue for task in normalized_tasks for issue in task.validation_issues),
+        ]
         status = self._plan_status(normalized_tasks, all_issues)
+        execution_order: tuple[str, ...] = ()
+        execution_stages: tuple[PlannerExecutionStage, ...] = ()
+        if not self._has_error([*dependency_issues, *plan_issues]):
+            execution_order = self._topological_sort(normalized_tasks)
+            execution_stages = self._build_execution_stages(normalized_tasks)
+            normalized_tasks = self._apply_execution_metadata(
+                normalized_tasks,
+                execution_order,
+                execution_stages,
+            )
+            all_issues = [
+                *plan_issues,
+                *(issue for task in normalized_tasks for issue in task.validation_issues),
+            ]
+            status = self._plan_status(normalized_tasks, all_issues)
+        unsupported_binding_count = sum(
+            issue.code == "UNSUPPORTED_TASK_OUTPUT_BINDING"
+            for issue in all_issues
+        )
+        execution_supported = (
+            status == "valid"
+            and unsupported_binding_count == 0
+            and not any(issue.code == "CONDITIONAL_EXECUTION_UNSUPPORTED" for issue in all_issues)
+        )
+        dependency_count = sum(len(task.depends_on) for task in normalized_tasks)
         diagnostics = PlannerDiagnostics(
             source=source,
             raw_task_count=len(raw_tasks),
@@ -167,21 +229,36 @@ class PlannerContractBuilder:
             invalid_task_count=sum(task.validation_status == "invalid" for task in normalized_tasks),
             capability_catalog_version=self._catalog_version(),
             fallback_used=fallback_used or source == "fallback",
-            normalization_warnings=tuple(diagnostics_notes),
+            normalization_warnings=list(diagnostics_notes),
             parse_failure=parse_failure,
             tool_selection_rule="task_type_exact_capability_index_first_tool_name_ascending",
-            missing_information=tuple(
+            missing_information=[
                 issue.parameter_name or issue.field or issue.code
                 for issue in all_issues
                 if issue.code == "CLARIFICATION_REQUIRED"
-            ),
+            ],
+            dependency_count=dependency_count,
+            stage_count=len(execution_stages),
+            maximum_parallel_width=max((len(stage.task_ids) for stage in execution_stages), default=0),
+            topological_sort_applied=bool(execution_order),
+            execution_supported=execution_supported,
+            unsupported_binding_count=unsupported_binding_count,
         )
         intent = self._intent(raw_output, question)
         metadata = {
             "task_count": len(normalized_tasks),
+            "dependency_count": dependency_count,
+            "stage_count": len(execution_stages),
+            "maximum_parallel_width": max((len(stage.task_ids) for stage in execution_stages), default=0),
             "issue_count": len(all_issues),
             "error_count": sum(issue.severity == "error" for issue in all_issues),
             "warning_count": sum(issue.severity == "warning" for issue in all_issues),
+            "execution_supported": execution_supported,
+            "task_output_binding_supported": False,
+            "limitations": [
+                "This step records task dependencies and stages but still adapts executable plans to a flat serial AnalysisTask list.",
+                "Only original_dataset bindings are currently executable; task_output bindings are declarative and unsupported at runtime.",
+            ],
         }
         return PlannerPlan(
             plan_id=self._stable_plan_id(intent, normalized_tasks, source),
@@ -191,10 +268,15 @@ class PlannerContractBuilder:
             status=status,
             planner_source=source,
             capability_catalog_version=self._catalog_version(),
-            warnings=tuple(issue.message for issue in all_issues if issue.severity == "warning"),
+            warnings=[issue.message for issue in all_issues if issue.severity == "warning"],
             validation_issues=tuple(all_issues),
             diagnostics=diagnostics,
             metadata=metadata,
+            execution_stages=execution_stages,
+            execution_order=execution_order,
+            has_dependencies=dependency_count > 0,
+            parallelizable=len(execution_stages) == 1 and len(normalized_tasks) > 1,
+            execution_supported=execution_supported,
         )
 
     def planner_task_to_analysis_task(self, task: PlannerTask) -> AnalysisTask:
@@ -213,7 +295,11 @@ class PlannerContractBuilder:
         """Adapt a valid plan into existing AnalysisTask objects."""
         if plan.status != "valid":
             raise ValueError("Only valid PlannerPlan objects can be adapted for execution.")
-        return [self.planner_task_to_analysis_task(task) for task in plan.tasks]
+        if not plan.execution_supported:
+            raise ValueError("Only executable PlannerPlan objects can be adapted for execution.")
+        task_by_id = {task.task_id: task for task in plan.tasks}
+        ordered_task_ids = plan.execution_order or tuple(task.task_id for task in plan.tasks)
+        return [self.planner_task_to_analysis_task(task_by_id[task_id]) for task_id in ordered_task_ids]
 
     def _normalize_task(
         self,
@@ -257,6 +343,10 @@ class PlannerContractBuilder:
         raw_params = self._strip_internal_params(task_type, raw.get("params", {}), diagnostics_notes)
         params, param_issues = self._validate_params(task_id, raw_params, capability)
         issues.extend(param_issues)
+        depends_on, dependency_shape_issues = self._normalize_depends_on(raw.get("depends_on"), task_id)
+        issues.extend(dependency_shape_issues)
+        input_bindings, input_binding_shape_issues = self._normalize_input_bindings(raw.get("input_bindings"), task_id)
+        issues.extend(input_binding_shape_issues)
         if capability is not None:
             issues.extend(self._validate_fields(task_id, params, capability, request_context))
         if capability is not None and not self._has_error(issues):
@@ -285,6 +375,8 @@ class PlannerContractBuilder:
             requires_confirmation=self._requires_confirmation(task_type, risk_level),
             validation_status=validation_status,
             validation_issues=tuple(issues),
+            depends_on=depends_on,
+            input_bindings=input_bindings,
         )
 
     def _resolve_capability(
@@ -664,6 +756,386 @@ class PlannerContractBuilder:
         )
         return []
 
+    def _normalize_depends_on(
+        self,
+        raw_depends_on: object,
+        task_id: str,
+    ) -> tuple[tuple[str, ...], list[PlannerValidationIssue]]:
+        if raw_depends_on is None:
+            return (), []
+        if not isinstance(raw_depends_on, list):
+            return (), [
+                self._issue(
+                    "INVALID_INPUT_BINDING",
+                    "depends_on must be an array of task ids.",
+                    "error",
+                    task_id=task_id,
+                    field="depends_on",
+                    expected="array[string]",
+                    actual=type(raw_depends_on).__name__,
+                    repairable=True,
+                )
+            ]
+        depends_on: list[str] = []
+        issues: list[PlannerValidationIssue] = []
+        for index, value in enumerate(raw_depends_on):
+            if not isinstance(value, str) or not value:
+                issues.append(
+                    self._issue(
+                        "INVALID_INPUT_BINDING",
+                        "depends_on must contain only non-empty task ids.",
+                        "error",
+                        task_id=task_id,
+                        field=f"depends_on[{index}]",
+                        expected="string",
+                        actual=type(value).__name__,
+                        repairable=True,
+                    )
+                )
+                continue
+            depends_on.append(value)
+        return tuple(depends_on), issues
+
+    def _normalize_input_bindings(
+        self,
+        raw_input_bindings: object,
+        task_id: str,
+    ) -> tuple[tuple[PlannerInputBinding, ...], list[PlannerValidationIssue]]:
+        if raw_input_bindings is None:
+            return (), []
+        if not isinstance(raw_input_bindings, list):
+            return (), [
+                self._issue(
+                    "INVALID_INPUT_BINDING",
+                    "input_bindings must be an array.",
+                    "error",
+                    task_id=task_id,
+                    field="input_bindings",
+                    expected="array[object]",
+                    actual=type(raw_input_bindings).__name__,
+                    repairable=True,
+                )
+            ]
+        bindings: list[PlannerInputBinding] = []
+        issues: list[PlannerValidationIssue] = []
+        for index, raw_binding in enumerate(raw_input_bindings):
+            if not isinstance(raw_binding, dict):
+                issues.append(
+                    self._issue(
+                        "INVALID_INPUT_BINDING",
+                        "Each input binding must be an object.",
+                        "error",
+                        task_id=task_id,
+                        field=f"input_bindings[{index}]",
+                        expected="object",
+                        actual=type(raw_binding).__name__,
+                        repairable=True,
+                    )
+                )
+                continue
+            try:
+                bindings.append(PlannerInputBinding.model_validate(raw_binding))
+            except ValueError as exc:
+                issues.append(
+                    self._issue(
+                        "INVALID_INPUT_BINDING",
+                        str(exc),
+                        "error",
+                        task_id=task_id,
+                        field=f"input_bindings[{index}]",
+                        repairable=True,
+                    )
+                )
+        return tuple(bindings), issues
+
+    def _validate_dependencies(self, tasks: list[PlannerTask]) -> list[PlannerValidationIssue]:
+        task_ids = {task.task_id for task in tasks}
+        issues: list[PlannerValidationIssue] = []
+        for task in tasks:
+            seen: set[str] = set()
+            for dependency_id in task.depends_on:
+                if dependency_id == task.task_id:
+                    issues.append(
+                        self._issue(
+                            "SELF_TASK_DEPENDENCY",
+                            f"Task '{task.task_id}' cannot depend on itself.",
+                            "error",
+                            task_id=task.task_id,
+                            field="depends_on",
+                            actual=dependency_id,
+                            repairable=True,
+                        )
+                    )
+                if dependency_id in seen:
+                    issues.append(
+                        self._issue(
+                            "DUPLICATE_TASK_DEPENDENCY",
+                            f"Task '{task.task_id}' contains duplicate dependency '{dependency_id}'.",
+                            "error",
+                            task_id=task.task_id,
+                            field="depends_on",
+                            actual=dependency_id,
+                            repairable=True,
+                        )
+                    )
+                seen.add(dependency_id)
+                if dependency_id not in task_ids:
+                    issues.append(
+                        self._issue(
+                            "UNKNOWN_DEPENDENCY_TASK",
+                            f"Task '{task.task_id}' depends on unknown task '{dependency_id}'.",
+                            "error",
+                            task_id=task.task_id,
+                            field="depends_on",
+                            actual=dependency_id,
+                            repairable=True,
+                        )
+                    )
+        if not issues and self._detect_cycle(tasks):
+            issues.append(
+                self._issue(
+                    "CYCLIC_TASK_DEPENDENCY",
+                    "Task dependencies contain a cycle.",
+                    "error",
+                    task_id=tasks[0].task_id if tasks else None,
+                    expected="acyclic dependency graph",
+                    actual=[task.task_id for task in tasks],
+                    repairable=True,
+                )
+            )
+        return issues
+
+    def _validate_input_bindings(self, tasks: list[PlannerTask]) -> list[PlannerValidationIssue]:
+        task_ids = {task.task_id for task in tasks}
+        issues: list[PlannerValidationIssue] = []
+        for task in tasks:
+            seen_input_names: set[str] = set()
+            for binding in task.input_bindings:
+                if binding.input_name in seen_input_names:
+                    issues.append(
+                        self._issue(
+                            "DUPLICATE_INPUT_BINDING",
+                            f"Task '{task.task_id}' has duplicate input binding '{binding.input_name}'.",
+                            "error",
+                            task_id=task.task_id,
+                            field="input_bindings",
+                            actual=binding.input_name,
+                            repairable=True,
+                        )
+                    )
+                seen_input_names.add(binding.input_name)
+                if binding.source_type == "planner_context":
+                    source_path = binding.source_path or ""
+                    if source_path not in ALLOWED_PLANNER_CONTEXT_PATHS:
+                        issues.append(
+                            self._issue(
+                                "INVALID_INPUT_BINDING",
+                                f"Planner context path '{source_path}' is not allowed.",
+                                "error",
+                                task_id=task.task_id,
+                                field="input_bindings.source_path",
+                                expected=sorted(ALLOWED_PLANNER_CONTEXT_PATHS),
+                                actual=source_path,
+                                repairable=True,
+                            )
+                        )
+                if binding.source_type != "task_output":
+                    continue
+                source_task_id = binding.source_task_id or ""
+                if source_task_id not in task_ids:
+                    issues.append(
+                        self._issue(
+                            "UNKNOWN_INPUT_SOURCE_TASK",
+                            f"Input binding references unknown source task '{source_task_id}'.",
+                            "error",
+                            task_id=task.task_id,
+                            field="input_bindings.source_task_id",
+                            actual=source_task_id,
+                            repairable=True,
+                        )
+                    )
+                    continue
+                if source_task_id not in task.depends_on:
+                    issues.append(
+                        self._issue(
+                            "INPUT_SOURCE_NOT_DEPENDENCY",
+                            "task_output binding source_task_id must also appear in depends_on.",
+                            "error",
+                            task_id=task.task_id,
+                            field="input_bindings.source_task_id",
+                            expected=list(task.depends_on),
+                            actual=source_task_id,
+                            repairable=True,
+                        )
+                    )
+                issues.append(
+                    self._issue(
+                        "UNSUPPORTED_TASK_OUTPUT_BINDING",
+                        "Task output bindings are declarative only in this step and cannot be executed as dataframe inputs.",
+                        "warning",
+                        task_id=task.task_id,
+                        field="input_bindings",
+                        actual={
+                            "input_name": binding.input_name,
+                            "source_task_id": source_task_id,
+                            "source_path": binding.source_path,
+                        },
+                        repairable=False,
+                    )
+                )
+        return issues
+
+    def _attach_task_issues(
+        self,
+        tasks: list[PlannerTask],
+        issues: list[PlannerValidationIssue],
+    ) -> list[PlannerTask]:
+        if not issues:
+            return tasks
+        issues_by_task: dict[str, list[PlannerValidationIssue]] = {}
+        plan_level_issues: list[PlannerValidationIssue] = []
+        for issue in issues:
+            if issue.task_id:
+                issues_by_task.setdefault(issue.task_id, []).append(issue)
+            else:
+                plan_level_issues.append(issue)
+        updated: list[PlannerTask] = []
+        for task in tasks:
+            task_issues = [*task.validation_issues, *issues_by_task.get(task.task_id, ())]
+            if any(issue.severity == "error" for issue in task_issues):
+                validation_status = "invalid"
+            else:
+                validation_status = task.validation_status
+            updated.append(
+                task.model_copy(
+                    update={
+                        "validation_issues": tuple(task_issues),
+                        "validation_status": validation_status,
+                    }
+                )
+            )
+        if plan_level_issues and updated:
+            first = updated[0]
+            task_issues = (*first.validation_issues, *plan_level_issues)
+            updated[0] = first.model_copy(
+                update={
+                    "validation_issues": task_issues,
+                    "validation_status": "invalid",
+                }
+            )
+        return updated
+
+    def _detect_cycle(self, tasks: list[PlannerTask]) -> bool:
+        return len(self._topological_sort(tasks)) != len(tasks)
+
+    def _topological_sort(self, tasks: list[PlannerTask]) -> tuple[str, ...]:
+        """Return a stable Kahn topological order, or empty tuple for invalid graphs."""
+        task_ids = [task.task_id for task in tasks]
+        task_id_set = set(task_ids)
+        dependencies: dict[str, list[str]] = {}
+        children: dict[str, list[str]] = {task_id: [] for task_id in task_ids}
+        for task in tasks:
+            if task.task_id in task.depends_on:
+                return ()
+            if len(set(task.depends_on)) != len(task.depends_on):
+                return ()
+            if any(dependency_id not in task_id_set for dependency_id in task.depends_on):
+                return ()
+            dependencies[task.task_id] = list(task.depends_on)
+            for dependency_id in task.depends_on:
+                children[dependency_id].append(task.task_id)
+        ready = [task_id for task_id in task_ids if not dependencies[task_id]]
+        order: list[str] = []
+        while ready:
+            current = ready.pop(0)
+            order.append(current)
+            for child_id in children[current]:
+                dependencies[child_id] = [item for item in dependencies[child_id] if item != current]
+                if not dependencies[child_id] and child_id not in ready and child_id not in order:
+                    ready.append(child_id)
+            ready.sort(key=task_ids.index)
+        return tuple(order) if len(order) == len(tasks) else ()
+
+    def _build_execution_stages(self, tasks: list[PlannerTask]) -> tuple[PlannerExecutionStage, ...]:
+        if not tasks:
+            return ()
+        task_by_id = {task.task_id: task for task in tasks}
+        task_ids = [task.task_id for task in tasks]
+        execution_order = self._topological_sort(tasks)
+        if not execution_order:
+            return ()
+        stage_by_task_id: dict[str, int] = {}
+        for task_id in execution_order:
+            task = task_by_id[task_id]
+            if task.depends_on:
+                stage_by_task_id[task.task_id] = 1 + max(stage_by_task_id[dependency_id] for dependency_id in task.depends_on)
+            else:
+                stage_by_task_id[task.task_id] = 1
+        stages: list[PlannerExecutionStage] = []
+        for stage_order in sorted(set(stage_by_task_id.values())):
+            stage_task_ids = tuple(task_id for task_id in task_ids if stage_by_task_id[task_id] == stage_order)
+            stage_tasks = [task_by_id[task_id] for task_id in stage_task_ids]
+            stages.append(
+                PlannerExecutionStage(
+                    stage_id=f"stage_{stage_order}",
+                    order=stage_order,
+                    task_ids=stage_task_ids,
+                    parallelizable=len(stage_task_ids) > 1,
+                    risk_level=self._highest_risk(task.risk_level for task in stage_tasks),
+                    requires_confirmation=any(task.requires_confirmation for task in stage_tasks),
+                    description=(
+                        f"Stage {stage_order} contains {len(stage_task_ids)} task(s) derived from dependency order; "
+                        "parallelizable describes dependency shape only, not actual concurrent execution."
+                    ),
+                )
+            )
+        return tuple(stages)
+
+    def _apply_execution_metadata(
+        self,
+        tasks: list[PlannerTask],
+        execution_order: tuple[str, ...],
+        execution_stages: tuple[PlannerExecutionStage, ...],
+    ) -> list[PlannerTask]:
+        order_index = {task_id: index + 1 for index, task_id in enumerate(execution_order)}
+        stage_index = {
+            task_id: stage.order
+            for stage in execution_stages
+            for task_id in stage.task_ids
+        }
+        return [
+            task.model_copy(
+                update={
+                    "execution_order": order_index.get(task.task_id),
+                    "execution_group": stage_index.get(task.task_id),
+                }
+            )
+            for task in tasks
+        ]
+
+    def _highest_risk(self, risk_levels) -> RiskLevel:
+        ordered = sorted(risk_levels, key=lambda level: RISK_LEVEL_PRIORITY[level], reverse=True)
+        return ordered[0] if ordered else "read_only"
+
+    def _has_unsupported_conditional_request(self, question: str | None) -> bool:
+        if not question:
+            return False
+        lowered = question.lower()
+        conditional_tokens = (
+            "if no problem",
+            "if there is no problem",
+            "if clean",
+            "only if",
+            "provided that",
+            "如果",
+            "假如",
+            "若",
+            "没有问题再",
+            "通过后再",
+            "否则",
+        )
+        return any(token in lowered for token in conditional_tokens)
+
     def _extract_raw_tasks(self, raw_output: object) -> list[object] | None:
         if isinstance(raw_output, list):
             return raw_output
@@ -792,7 +1264,7 @@ class PlannerContractBuilder:
         tasks: list[PlannerTask],
         issues: list[PlannerValidationIssue],
     ) -> str:
-        if any(issue.code == "CLARIFICATION_REQUIRED" for issue in issues):
+        if any(issue.code in {"CLARIFICATION_REQUIRED", "CONDITIONAL_EXECUTION_UNSUPPORTED"} for issue in issues):
             return "clarification_required"
         if not tasks:
             return "unsupported"
@@ -822,6 +1294,8 @@ class PlannerContractBuilder:
                     "task_type": task.task_type,
                     "tool_name": task.tool_name,
                     "params": task.params,
+                    "depends_on": list(task.depends_on),
+                    "input_bindings": [binding.model_dump(mode="json") for binding in task.input_bindings],
                 }
                 for task in tasks
             ],
